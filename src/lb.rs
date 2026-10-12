@@ -3,10 +3,10 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{body::Bytes, Request, Response, Uri};
+use hyper::{body::Bytes, HeaderMap, Method, Request, Response, Uri, Version};
 use hyper_util::rt::TokioIo;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -272,11 +272,7 @@ where
                 .serve_connection(
                     io,
                     service_fn(move |req| {
-                        handle_request(
-                            Arc::new(Some(req)),
-                            Arc::clone(&lb_clone),
-                            Arc::clone(&load_balancer_clone),
-                        )
+                        handle_request(req, Arc::clone(&lb_clone), Arc::clone(&load_balancer_clone))
                     }),
                 )
                 .await
@@ -286,50 +282,25 @@ where
         });
     }
 }
-#[derive(Debug)]
-struct HttpRequestDetails {
-    method: String,
-    uri: String,
-    version: String,
-    headers: Vec<(String, String)>,
-    body: String,
-}
 async fn handle_request<T>(
-    req: Arc<Option<Request<hyper::body::Incoming>>>,
+    req: Request<hyper::body::Incoming>,
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     T: Loadbalancer,
 {
-    // Extract and print the incoming request details
-    let request_details = if let Some(req) = req.as_ref() {
-        let headers = req
-            .headers()
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
-            .collect();
-
-        let var = HttpRequestDetails {
-            method: req.method().to_string(),
-            uri: req.uri().to_string(),
-            version: format!("{:?}", req.version()),
-            headers,
-            body: "Body details here".to_string(), // Placeholder, body extraction can be done if needed
-        };
-        println!("Incoming request details: {:?}", var);
-    } else {
-        let var = HttpRequestDetails {
-            method: "Unknown".to_string(),
-            uri: "Unknown".to_string(),
-            version: "Unknown".to_string(),
-            headers: vec![],
-            body: "No body".to_string(),
-        };
-        println!("Incoming request details: {:?}", var);
+    let (parts, body) = req.into_parts();
+    let body = match body.collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(err) => {
+            eprintln!("Failed to read incoming request body: {err}");
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from_static(b"Invalid request body")))
+                .expect("static response is valid"));
+        }
     };
-
-    //println!("Incoming request details: {:?}", var );
 
     loop {
         let len = lb
@@ -338,11 +309,14 @@ where
             .servers
             .iter()
             .filter(|server| server.alive && server.connections < server.max_connections)
-            .collect::<Vec<&Server>>()
-            .len();
+            .count();
         if len > 0 {
             match get_request(
-                Arc::clone(&req),
+                &parts.method,
+                &parts.uri,
+                parts.version,
+                &parts.headers,
+                &body,
                 Arc::clone(&lb),
                 Arc::clone(&load_balancer),
             )
@@ -368,14 +342,18 @@ where
 }
 
 async fn get_request<T>(
-    req: Arc<Option<Request<hyper::body::Incoming>>>,
+    method: &Method,
+    incoming_uri: &Uri,
+    version: Version,
+    headers: &HeaderMap,
+    body: &Bytes,
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
 ) -> Option<Result<Response<Full<Bytes>>, Infallible>>
 where
     T: Loadbalancer,
 {
-    let (server, timeout_duration, index) = {
+    let (timeout_duration, index, uri) = {
         // updates server details and gets a local copy of server
         let mut lb = lb.lock().unwrap();
 
@@ -388,7 +366,8 @@ where
         index_opt?;
 
         let index = index_opt.unwrap();
-        let server = servers_alive[index].clone();
+        let server = (*servers_alive[index]).clone();
+        let uri = backend_uri(&server.addr, incoming_uri).ok()?;
 
         let index_opt = lb
             .servers
@@ -400,24 +379,16 @@ where
 
         lb.servers[index].connections += 1;
         lb.servers[index].connections_served += 1;
-        (lb.servers[index].clone(), lb.timeout, index)
+        (lb.timeout, index, uri)
     };
-
-    let request = match &*req {
-        Some(req) => format!(
-            "{}{}",
-            server.addr.clone(),
-            req.uri().to_string().trim_start_matches('/')
-        ),
-        None => server.addr.to_string(),
-    }; // updates the address
-
-    println!("forwarded request to {:?}", request);
 
     let start = Instant::now();
 
-    let data = timeout(timeout_duration, send_request(request)).await; // sends request to the address
-    println!("{:?}", data);
+    let data = timeout(
+        timeout_duration,
+        send_request(uri, method, version, headers, body),
+    )
+    .await;
 
     let duration = start.elapsed(); // gets response time
 
@@ -432,7 +403,7 @@ where
     match data {
         Ok(data) => {
             match data {
-                Ok(data) => Some(Ok(Response::new(Full::new(data)))),
+                Ok(response) => Some(Ok(response)),
                 Err(_) => {
                     // sends server to `dead_servers` list if server is dead
                     lb.servers[index].connections = 0;
@@ -452,57 +423,97 @@ where
     }
 }
 
-async fn send_request(request: String) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    // Parse our URL...
-    let url = request.parse::<hyper::Uri>()?;
+fn backend_uri(backend: &Uri, incoming: &Uri) -> Result<Uri, String> {
+    let authority = backend
+        .authority()
+        .ok_or_else(|| "backend URI has no authority".to_string())?;
+    let scheme = backend.scheme_str().unwrap_or("http");
+    let path_and_query = incoming
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
 
-    // Get the host and the port
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(80);
+    Uri::builder()
+        .scheme(scheme)
+        .authority(authority.as_str())
+        .path_and_query(path_and_query)
+        .build()
+        .map_err(|err| err.to_string())
+}
 
-    let address = format!("{}:{}", host, port);
+async fn send_request(
+    uri: Uri,
+    method: &Method,
+    version: Version,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+    let host = uri.host().ok_or("backend URI has no host")?;
+    let port = uri.port_u16().unwrap_or(80);
+    let address = if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
 
-    // Open a TCP connection to the remote host
     let stream = TcpStream::connect(address).await?;
-
-    // Use an adapter to access something implementing `tokio::io` traits as if they implement
-    // `hyper::rt` IO traits.
     let io = TokioIo::new(stream);
-
-    // Create the Hyper client
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
 
-    // Spawn a task to poll the connection, driving the HTTP state
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
+            eprintln!("Backend connection failed: {err}");
         }
     });
 
-    // The authority of our URL will be the hostname of the httpbin remote
-    let authority = url.authority().unwrap().clone();
+    let mut forwarded_headers = headers.clone();
+    forwarded_headers.remove(hyper::header::CONNECTION);
+    forwarded_headers.remove(hyper::header::HeaderName::from_static("keep-alive"));
+    forwarded_headers.remove(hyper::header::PROXY_AUTHENTICATE);
+    forwarded_headers.remove(hyper::header::PROXY_AUTHORIZATION);
+    forwarded_headers.remove(hyper::header::TE);
+    forwarded_headers.remove(hyper::header::TRAILER);
+    forwarded_headers.remove(hyper::header::TRANSFER_ENCODING);
+    forwarded_headers.remove(hyper::header::UPGRADE);
+    forwarded_headers.insert(
+        hyper::header::HOST,
+        uri.authority()
+            .ok_or("backend URI has no authority")?
+            .as_str()
+            .parse()?,
+    );
 
-    // Create an HTTP request with an empty body and a HOST header
-    let req = Request::builder()
-        .uri(url)
-        .header(hyper::header::HOST, authority.as_str())
-        .body(Empty::<Bytes>::new())?;
+    let mut request = Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .version(version)
+        .body(Full::new(body.clone()))?;
+    *request.headers_mut() = forwarded_headers;
 
-    // Await the response...
-    let mut res = sender.send_request(req).await?;
+    let response = sender.send_request(request).await?;
+    let (parts, body) = response.into_parts();
+    let body = body.collect().await?.to_bytes();
+    let mut response = Response::from_parts(parts, Full::new(body));
 
-    // println!("Response status: {}", res.status());
+    // The client connection is not reused; remove hop-by-hop response headers.
+    response.headers_mut().remove(hyper::header::CONNECTION);
+    response
+        .headers_mut()
+        .remove(hyper::header::HeaderName::from_static("keep-alive"));
+    response
+        .headers_mut()
+        .remove(hyper::header::PROXY_AUTHENTICATE);
+    response
+        .headers_mut()
+        .remove(hyper::header::PROXY_AUTHORIZATION);
+    response.headers_mut().remove(hyper::header::TE);
+    response.headers_mut().remove(hyper::header::TRAILER);
+    response
+        .headers_mut()
+        .remove(hyper::header::TRANSFER_ENCODING);
+    response.headers_mut().remove(hyper::header::UPGRADE);
 
-    let mut full_body = Vec::new();
-
-    while let Some(next) = res.frame().await {
-        let frame = next?;
-        if let Some(chunk) = frame.data_ref() {
-            full_body.extend_from_slice(chunk);
-        }
-    }
-
-    Ok(Bytes::from(full_body))
+    Ok(response)
 }
 
 pub trait Loadbalancer {

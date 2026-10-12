@@ -1,5 +1,4 @@
 use clap::{command, Arg, ArgAction, Command};
-use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -142,7 +141,7 @@ enum Algorithm {
     WeightedLeastResponseTime,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut lb = LoadBalancer::new();
     lb.update("config.yaml")?;
 
@@ -151,7 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Ok(())
 }
 
-fn cli(mut lb: LoadBalancer) -> Result<(), Box<dyn Error>> {
+fn cli(mut lb: LoadBalancer) -> Result<(), Box<dyn Error + Send + Sync>> {
     let res = command!()
         .arg_required_else_help(true)
         .about(
@@ -221,6 +220,7 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
             let report = start_args.get_one::<bool>("report");
             let save = start_args.get_one::<String>("save file");
             let write = start_args.get_one::<bool>("save config");
+            let config_path = path.map(String::as_str).unwrap_or("config.yaml");
 
             if let Some(path) = path {
                 lb.servers = Vec::new();
@@ -244,11 +244,11 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
                 lb.save = true;
             }
 
-            if let Some(write) = write {
-                //lb.write = *write;
+            if write.copied().unwrap_or(false) {
+                write_to_config(&lb, config_path)?;
             }
 
-            drop(lb::start_lb(lb));
+            lb::start_lb(lb)?;
         }
         _ => println!("Invalid command"),
     }
@@ -268,17 +268,43 @@ fn get_algo(algo: &str) -> Algorithm {
     }
 }
 
-fn write_to_config(address: String, algorithm: String, path: String) {
-    let yaml = serde_yaml::to_string(&LoadBalancer {
-        load_balancer: address.parse::<hyper::Uri>().unwrap(),
-        algo: get_algo(&algorithm),
-        servers: Vec::new(),
-        timeout: Duration::from_secs(0),
-        health_check_interval: Duration::from_secs(0),
-        report: true,
-        save_file: String::from("data.txt"),
-        save: false,
-    })
-    .unwrap();
-    fs::write(path, yaml).unwrap();
+fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
+    let algorithm = match lb.algo {
+        Algorithm::RoundRobin => "round_robin",
+        Algorithm::WeightedRoundRobin => "weighted_round_robin",
+        Algorithm::LeastConnections => "least_connections",
+        Algorithm::WeightedLeastConnections => "weighted_least_connections",
+        Algorithm::LeastResponseTime => "least_response_time",
+        Algorithm::WeightedLeastResponseTime => "weighted_least_response_time",
+    };
+    let servers = lb
+        .servers
+        .iter()
+        .map(|server| server.addr.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let weights = lb
+        .servers
+        .iter()
+        .map(|server| server.weight.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let max_connections = lb
+        .servers
+        .iter()
+        .map(|server| server.max_connections.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = format!(
+        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nhealth check interval: {}\n",
+        lb.load_balancer,
+        algorithm,
+        servers,
+        weights,
+        max_connections,
+        lb.timeout.as_secs(),
+        lb.health_check_interval.as_secs(),
+    );
+
+    std::fs::write(path, config)
 }
