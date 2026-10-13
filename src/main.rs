@@ -1,10 +1,9 @@
 use clap::{command, Arg, ArgAction, Command};
 use std::error::Error;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
-use std::path::Path;
+use std::io;
 use std::time::Duration;
 
+mod config;
 mod lb;
 
 #[derive(Debug)]
@@ -67,129 +66,24 @@ impl LoadBalancer {
         }
     }
     fn update(&mut self, path: &str) -> io::Result<&LoadBalancer> {
-        let path = Path::new(path);
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-
-        let mut servers: Vec<hyper::Uri> = Vec::new();
-        let mut weights: Vec<u32> = Vec::new();
-        let mut max_connections: Vec<u32> = Vec::new();
-        let mut server_timeouts: Option<Vec<Option<Duration>>> = None;
-        let mut health_check_timeout = None;
-
-        for line in reader.lines() {
-            let line = line?;
-            if line.starts_with("load balancer:") {
-                let load_balancer = line
-                    .trim_start_matches("load balancer:")
-                    .trim()
-                    .parse::<hyper::Uri>();
-                let load_balancer = match load_balancer {
-                    Ok(load_balancer) => load_balancer,
-                    Err(_) => "http://127.0.0.1:8000".parse::<hyper::Uri>().unwrap(), // default address for load balancer
-                };
-                self.load_balancer = load_balancer;
-            } else if line.starts_with("algorithm:") {
-                let algo = line.trim_start_matches("algorithm:").trim();
-                self.algo = get_algo(algo);
-            } else if line.starts_with("servers:") {
-                let servers_str = line.trim_start_matches("servers:").trim();
-                servers = servers_str
-                    .split(',')
-                    .map(|server| server.trim().parse::<hyper::Uri>().expect("Invalid URI"))
-                    .collect();
-            } else if line.starts_with("weights:") {
-                let weights_str = line.trim_start_matches("weights:").trim();
-                weights = weights_str
-                    .split(',')
-                    .map(|weight| weight.trim().parse::<u32>().expect("Invalid weight"))
-                    .collect();
-            } else if line.starts_with("max connections:") {
-                let max_connections_str = line.trim_start_matches("max connections:").trim();
-                max_connections = max_connections_str
-                    .split(',')
-                    .map(|max_connection| {
-                        max_connection
-                            .trim()
-                            .parse::<u32>()
-                            .expect("Invalid max connection")
-                    })
-                    .collect();
-            } else if line.starts_with("server timeouts:") {
-                let values = line.trim_start_matches("server timeouts:").trim();
-                let values = values
-                    .split(',')
-                    .map(|value| {
-                        let value = value.trim();
-                        if value.eq_ignore_ascii_case("default") {
-                            Ok(None)
-                        } else {
-                            value
-                                .parse::<u64>()
-                                .map(Duration::from_secs)
-                                .map(Some)
-                                .map_err(|_| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        format!(
-                                            "invalid server timeout '{value}'; expected seconds or 'default'"
-                                        ),
-                                    )
-                                })
-                        }
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                server_timeouts = Some(values);
-            } else if line.starts_with("timeout:") {
-                let timeout = line.trim_start_matches("timeout:").trim();
-                self.timeout =
-                    Duration::from_secs(timeout.parse::<u64>().expect("Invalid timeout"));
-            } else if line.starts_with("health check timeout:") {
-                let timeout = line.trim_start_matches("health check timeout:").trim();
-                let seconds = timeout.parse::<u64>().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid health check timeout '{timeout}'"),
-                    )
-                })?;
-                health_check_timeout = Some(Duration::from_secs(seconds));
-            } else if line.starts_with("health check interval:") {
-                let health_check_interval =
-                    line.trim_start_matches("health check interval:").trim();
-                self.health_check_interval = Duration::from_secs(
-                    health_check_interval
-                        .parse::<u64>()
-                        .expect("Invalid health check interval"),
-                );
-            }
-        }
-
-        if let Some(timeouts) = &server_timeouts {
-            if timeouts.len() != servers.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "server timeouts has {} entries but servers has {}",
-                        timeouts.len(),
-                        servers.len()
-                    ),
-                ));
-            }
-        }
-
-        self.health_check_timeout = health_check_timeout.unwrap_or(self.timeout);
-
-        for i in 0..servers.len() {
-            self.servers.push(Server::new(
-                servers[i].clone(),
-                weights[i],
-                max_connections[i],
-                server_timeouts
-                    .as_ref()
-                    .map(|timeouts| timeouts[i])
-                    .unwrap_or(None),
-            ));
-        }
+        let config = config::load(path)?;
+        self.load_balancer = config.load_balancer;
+        self.algo = get_algo(&config.algorithm);
+        self.servers = config
+            .servers
+            .into_iter()
+            .map(|server| {
+                Server::new(
+                    server.addr,
+                    server.weight,
+                    server.max_connections,
+                    server.request_timeout,
+                )
+            })
+            .collect();
+        self.timeout = config.timeout;
+        self.health_check_timeout = config.health_check_timeout;
+        self.health_check_interval = config.health_check_interval;
 
         Ok(self)
     }
