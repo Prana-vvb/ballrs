@@ -1,20 +1,30 @@
+# load balancer address
 load balancer: http://127.0.0.1:8000
-!!  load balancer address
 
+# load balancer algorithm to use
+# round_robin, weighted_round_robin, least_connections
+# weighted_least_connections, least_response_time, weighted_least_response_time
 algorithm: round_robin
-!!  load balancer algorithm
 
+# backend server addresses
 servers: http://127.0.0.1:3001, http://127.0.0.1:3002, http://127.0.0.1:3003
-!!  server address
 
+# backend server weights per server defined
+# (optional depending on the algorithm being used)
 weights: 20, 30, 10
-!!  server weights
 
+# max connections per server defined
 max connections: 1000, 1000, 1000
-!!  max connections
 
+# max server response time (in s)
 timeout: 10
-!!  max server response time (in s)
 
+# request timeout overrides in server-list order
+# use 'default' for global timeout
+server timeouts: default, default, default
+
+# max time allowed for a health check (in s)
+health check timeout: 10
+
+#  interval (in s) for checking the health of the server
 health check interval: 10
-!!  interval (in s) for checking the health of the server

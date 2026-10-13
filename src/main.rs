@@ -13,6 +13,7 @@ struct LoadBalancer {
     algo: Algorithm,
     servers: Vec<Server>,
     timeout: Duration,
+    health_check_timeout: Duration,
     health_check_interval: Duration,
     report: bool,
     save_file: String,
@@ -26,12 +27,18 @@ struct Server {
     response_time: Duration,
     connections: u32,
     max_connections: u32,
+    request_timeout: Option<Duration>,
     alive: bool,
     connections_served: u32,
 }
 
 impl Server {
-    fn new(addr: hyper::Uri, weight: u32, max_connections: u32) -> Self {
+    fn new(
+        addr: hyper::Uri,
+        weight: u32,
+        max_connections: u32,
+        request_timeout: Option<Duration>,
+    ) -> Self {
         Server {
             addr,
             weight,
@@ -40,6 +47,7 @@ impl Server {
             connections: 0,
             alive: true,
             connections_served: 0,
+            request_timeout,
         }
     }
 }
@@ -51,6 +59,7 @@ impl LoadBalancer {
             algo: Algorithm::RoundRobin, // using round robin as default algorithm
             servers: Vec::new(),
             timeout: Duration::from_secs(0),
+            health_check_timeout: Duration::from_secs(0),
             health_check_interval: Duration::from_secs(0),
             report: true,
             save_file: String::from("data.txt"),
@@ -65,6 +74,8 @@ impl LoadBalancer {
         let mut servers: Vec<hyper::Uri> = Vec::new();
         let mut weights: Vec<u32> = Vec::new();
         let mut max_connections: Vec<u32> = Vec::new();
+        let mut server_timeouts: Option<Vec<Option<Duration>>> = None;
+        let mut health_check_timeout = None;
 
         for line in reader.lines() {
             let line = line?;
@@ -104,10 +115,44 @@ impl LoadBalancer {
                             .expect("Invalid max connection")
                     })
                     .collect();
+            } else if line.starts_with("server timeouts:") {
+                let values = line.trim_start_matches("server timeouts:").trim();
+                let values = values
+                    .split(',')
+                    .map(|value| {
+                        let value = value.trim();
+                        if value.eq_ignore_ascii_case("default") {
+                            Ok(None)
+                        } else {
+                            value
+                                .parse::<u64>()
+                                .map(Duration::from_secs)
+                                .map(Some)
+                                .map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!(
+                                            "invalid server timeout '{value}'; expected seconds or 'default'"
+                                        ),
+                                    )
+                                })
+                        }
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                server_timeouts = Some(values);
             } else if line.starts_with("timeout:") {
                 let timeout = line.trim_start_matches("timeout:").trim();
                 self.timeout =
                     Duration::from_secs(timeout.parse::<u64>().expect("Invalid timeout"));
+            } else if line.starts_with("health check timeout:") {
+                let timeout = line.trim_start_matches("health check timeout:").trim();
+                let seconds = timeout.parse::<u64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid health check timeout '{timeout}'"),
+                    )
+                })?;
+                health_check_timeout = Some(Duration::from_secs(seconds));
             } else if line.starts_with("health check interval:") {
                 let health_check_interval =
                     line.trim_start_matches("health check interval:").trim();
@@ -119,11 +164,30 @@ impl LoadBalancer {
             }
         }
 
+        if let Some(timeouts) = &server_timeouts {
+            if timeouts.len() != servers.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "server timeouts has {} entries but servers has {}",
+                        timeouts.len(),
+                        servers.len()
+                    ),
+                ));
+            }
+        }
+
+        self.health_check_timeout = health_check_timeout.unwrap_or(self.timeout);
+
         for i in 0..servers.len() {
             self.servers.push(Server::new(
                 servers[i].clone(),
                 weights[i],
                 max_connections[i],
+                server_timeouts
+                    .as_ref()
+                    .map(|timeouts| timeouts[i])
+                    .unwrap_or(None),
             ));
         }
 
@@ -224,7 +288,7 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
 
             if let Some(path) = path {
                 lb.servers = Vec::new();
-                lb.update(path).unwrap();
+                lb.update(path)?;
             }
 
             if let Some(address) = address {
@@ -295,14 +359,27 @@ fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
         .map(|server| server.max_connections.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let server_timeouts = lb
+        .servers
+        .iter()
+        .map(|server| {
+            server
+                .request_timeout
+                .map(|timeout| timeout.as_secs().to_string())
+                .unwrap_or_else(|| "default".to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let config = format!(
-        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nhealth check interval: {}\n",
+        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nserver timeouts: {}\nhealth check timeout: {}\nhealth check interval: {}\n",
         lb.load_balancer,
         algorithm,
         servers,
         weights,
         max_connections,
         lb.timeout.as_secs(),
+        server_timeouts,
+        lb.health_check_timeout.as_secs(),
         lb.health_check_interval.as_secs(),
     );
 

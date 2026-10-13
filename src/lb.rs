@@ -40,13 +40,13 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
     // starts the load balancer
     let lb = Arc::new(Mutex::new(lb));
 
-    let (health_check_interval, len, timeout_duration, report, save, save_file) = {
+    let (health_check_interval, len, health_check_timeout, report, save, save_file) = {
         // gets health check interval and number of servers
         let lb_lock = lb.lock().unwrap();
         (
             lb_lock.health_check_interval,
             lb_lock.servers.len(),
-            lb_lock.timeout,
+            lb_lock.health_check_timeout,
             lb_lock.report,
             lb_lock.save,
             lb_lock.save_file.clone(),
@@ -77,7 +77,7 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
 
                     let start = Instant::now();
                     let response = timeout(
-                        timeout_duration,
+                        health_check_timeout,
                         reqwest::get(server.addr.clone().to_string()),
                     )
                     .await; // sends a request to server
@@ -379,7 +379,11 @@ where
 
         lb.servers[index].connections += 1;
         lb.servers[index].connections_served += 1;
-        (lb.timeout, index, uri)
+        (
+            lb.servers[index].request_timeout.unwrap_or(lb.timeout),
+            index,
+            uri,
+        )
     };
 
     let start = Instant::now();
