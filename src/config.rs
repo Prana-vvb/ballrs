@@ -103,30 +103,24 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
         )
     })?;
     validate_list_len("weights", weights.len(), server_addrs.len())?;
-    validate_list_len(
-        "max connections",
-        max_connections.len(),
-        server_addrs.len(),
-    )?;
+    validate_list_len("max connections", max_connections.len(), server_addrs.len())?;
 
     let server_timeouts = server_timeouts.unwrap_or_else(|| vec![None; server_addrs.len()]);
-    validate_list_len(
-        "server timeouts",
-        server_timeouts.len(),
-        server_addrs.len(),
-    )?;
+    validate_list_len("server timeouts", server_timeouts.len(), server_addrs.len())?;
 
     let servers = server_addrs
         .into_iter()
         .zip(weights)
         .zip(max_connections)
         .zip(server_timeouts)
-        .map(|(((addr, weight), max_connections), request_timeout)| ServerConfig {
-            addr,
-            weight,
-            max_connections,
-            request_timeout,
-        })
+        .map(
+            |(((addr, weight), max_connections), request_timeout)| ServerConfig {
+                addr,
+                weight,
+                max_connections,
+                request_timeout,
+            },
+        )
         .collect();
 
     Ok(Config {

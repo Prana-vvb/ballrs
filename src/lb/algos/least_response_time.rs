@@ -16,6 +16,7 @@ impl Loadbalancer for LeastResponseTime {
             .enumerate()
             .min_by_key(|(_, server)| server.response_time.as_millis() as u32)
             .map(|(index, _)| index);
+
         min_index
     }
 }

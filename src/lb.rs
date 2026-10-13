@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -302,43 +303,74 @@ where
         }
     };
 
+    let retryable = matches!(
+        parts.method.as_str(),
+        "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+    );
+    let mut attempted = HashSet::new();
+    let mut last_failure = None;
+
     loop {
-        let len = lb
-            .lock()
-            .unwrap()
-            .servers
-            .iter()
-            .filter(|server| server.alive && server.connections < server.max_connections)
-            .count();
-        if len > 0 {
-            match get_request(
-                &parts.method,
-                &parts.uri,
-                parts.version,
-                &parts.headers,
-                &body,
-                Arc::clone(&lb),
-                Arc::clone(&load_balancer),
-            )
-            .await
-            {
-                Some(request) => {
-                    return request;
-                }
-                None => {
-                    eprintln!("rerouting request to a new server");
-                }
+        match get_request(
+            &parts.method,
+            &parts.uri,
+            parts.version,
+            &parts.headers,
+            &body,
+            &mut attempted,
+            Arc::clone(&lb),
+            Arc::clone(&load_balancer),
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(ProxyFailure::NoBackend) => {
+                return Ok(failure_response(
+                    last_failure.unwrap_or(ProxyFailure::NoBackend),
+                ));
             }
-        } else {
-            eprintln!("No servers available");
-            let body = "No servers available, please try again".to_string(); // writes the body of html file
-            let response = Response::builder()
-                .status(500)
-                .body(Full::new(Bytes::from(body)))
-                .unwrap();
-            return Ok(response);
+            Err(failure) => {
+                if !retryable {
+                    return Ok(failure_response(failure));
+                }
+                last_failure = Some(match (last_failure, failure) {
+                    (Some(ProxyFailure::GatewayTimeout), _) | (_, ProxyFailure::GatewayTimeout) => {
+                        ProxyFailure::GatewayTimeout
+                    }
+                    _ => ProxyFailure::BadGateway,
+                });
+            }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ProxyFailure {
+    NoBackend,
+    BadGateway,
+    GatewayTimeout,
+}
+
+fn failure_response(failure: ProxyFailure) -> Response<Full<Bytes>> {
+    let (status, message) = match failure {
+        ProxyFailure::NoBackend => (
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "No backend is currently available",
+        ),
+        ProxyFailure::BadGateway => (
+            hyper::StatusCode::BAD_GATEWAY,
+            "All attempted backends failed",
+        ),
+        ProxyFailure::GatewayTimeout => (
+            hyper::StatusCode::GATEWAY_TIMEOUT,
+            "Backend request timed out",
+        ),
+    };
+
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::from_static(message.as_bytes())))
+        .expect("static proxy error response is valid")
 }
 
 async fn get_request<T>(
@@ -347,35 +379,40 @@ async fn get_request<T>(
     version: Version,
     headers: &HeaderMap,
     body: &Bytes,
+    attempted: &mut HashSet<usize>,
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
-) -> Option<Result<Response<Full<Bytes>>, Infallible>>
+) -> Result<Response<Full<Bytes>>, ProxyFailure>
 where
     T: Loadbalancer,
 {
     let (timeout_duration, index, uri) = {
-        // updates server details and gets a local copy of server
         let mut lb = lb.lock().unwrap();
 
-        let servers_alive: Vec<&Server> = lb
+        let eligible: Vec<(usize, &Server)> = lb
             .servers
             .iter()
-            .filter(|server| server.alive && server.connections < server.max_connections)
+            .enumerate()
+            .filter(|(index, server)| {
+                server.alive
+                    && server.connections < server.max_connections
+                    && !attempted.contains(index)
+            })
             .collect();
-        let index_opt = load_balancer.lock().unwrap().get_index(&servers_alive);
-        index_opt?;
-
-        let index = index_opt.unwrap();
-        let server = (*servers_alive[index]).clone();
-        let uri = backend_uri(&server.addr, incoming_uri).ok()?;
-
-        let index_opt = lb
-            .servers
-            .iter()
-            .position(|c_server| c_server.addr == server.addr); // get's the index of dead_server
-        index_opt?;
-
-        let index = index_opt.unwrap();
+        if eligible.is_empty() {
+            return Err(ProxyFailure::NoBackend);
+        }
+        let eligible_refs: Vec<&Server> = eligible.iter().map(|(_, server)| *server).collect();
+        let Some(selected) = load_balancer.lock().unwrap().get_index(&eligible_refs) else {
+            return Err(ProxyFailure::NoBackend);
+        };
+        let Some((index, server)) = eligible.get(selected) else {
+            return Err(ProxyFailure::NoBackend);
+        };
+        let index = *index;
+        let backend = server.addr.clone();
+        attempted.insert(index);
+        let uri = backend_uri(&backend, incoming_uri).map_err(|_| ProxyFailure::BadGateway)?;
 
         lb.servers[index].connections += 1;
         lb.servers[index].connections_served += 1;
@@ -394,7 +431,7 @@ where
     )
     .await;
 
-    let duration = start.elapsed(); // gets response time
+    let duration = start.elapsed();
 
     let mut lb = lb.lock().unwrap();
 
@@ -405,24 +442,17 @@ where
     }
 
     match data {
-        Ok(data) => {
-            match data {
-                Ok(response) => Some(Ok(response)),
-                Err(_) => {
-                    // sends server to `dead_servers` list if server is dead
-                    lb.servers[index].connections = 0;
-                    lb.servers[index].alive = false;
-                    None
-                }
-            }
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(err)) => {
+            eprintln!("Backend request failed: {err}");
+            lb.servers[index].connections = 0;
+            lb.servers[index].alive = false;
+            Err(ProxyFailure::BadGateway)
         }
         Err(_) => {
-            // sends server to `dead_servers` list if server is dead
-            if data.is_err() {
-                lb.servers[index].connections = 0;
-                lb.servers[index].alive = false;
-            }
-            None
+            lb.servers[index].connections = 0;
+            lb.servers[index].alive = false;
+            Err(ProxyFailure::GatewayTimeout)
         }
     }
 }

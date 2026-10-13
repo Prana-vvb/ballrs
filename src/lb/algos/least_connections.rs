@@ -16,6 +16,7 @@ impl Loadbalancer for LeastConnections {
             .enumerate()
             .min_by_key(|(_, server)| server.connections)
             .map(|(index, _)| index);
+
         min_index
     }
 }

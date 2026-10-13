@@ -26,13 +26,14 @@ impl WeightedRoundRobin {
 
 impl Loadbalancer for WeightedRoundRobin {
     fn get_index(&mut self, servers: &[&Server]) -> Option<usize> {
-        let weights: Vec<usize> = servers.iter().map(|s| s.weight as usize).collect();
-        let max_weight = *weights.iter().max().unwrap_or(&1);
-        let gcd_weight = weights.iter().copied().reduce(Self::gcd).unwrap_or(1);
         let len = servers.len();
         if len == 0 {
             return None;
         }
+
+        let weights: Vec<usize> = servers.iter().map(|s| s.weight as usize).collect();
+        let max_weight = *weights.iter().max().unwrap_or(&1);
+        let gcd_weight = weights.iter().copied().reduce(Self::gcd).unwrap_or(1);
 
         loop {
             let index = self.counter.fetch_add(1, Ordering::SeqCst) % len;

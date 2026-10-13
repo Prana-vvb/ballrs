@@ -16,6 +16,7 @@ impl Loadbalancer for WeightedLeastResponseTime {
             .enumerate()
             .min_by_key(|(_, server)| server.response_time.as_millis() as u32 / server.weight)
             .map(|(index, _)| index);
+
         min_index
     }
 }
