@@ -14,6 +14,7 @@ impl Loadbalancer for WeightedLeastResponseTime {
         let min_index = servers
             .iter()
             .enumerate()
+            .filter(|(_, server)| server.weight > 0)
             .min_by_key(|(_, server)| server.response_time.as_millis() as u32 / server.weight)
             .map(|(index, _)| index);
 

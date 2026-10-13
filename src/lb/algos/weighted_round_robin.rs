@@ -33,6 +33,9 @@ impl Loadbalancer for WeightedRoundRobin {
 
         let weights: Vec<usize> = servers.iter().map(|s| s.weight as usize).collect();
         let max_weight = *weights.iter().max().unwrap_or(&1);
+        if max_weight == 0 {
+            return None;
+        }
         let gcd_weight = weights.iter().copied().reduce(Self::gcd).unwrap_or(1);
 
         loop {

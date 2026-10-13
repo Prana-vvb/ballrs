@@ -14,6 +14,7 @@ impl Loadbalancer for WeightedLeastConnections {
         let min_index = servers
             .iter()
             .enumerate()
+            .filter(|(_, server)| server.weight > 0)
             .min_by_key(|(_, server)| server.connections / server.weight)
             .map(|(index, _)| index);
 
