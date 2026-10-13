@@ -11,4 +11,5 @@ hyper-util = { version = "0.1", features = ["full"] }
 reqwest = "0.13"
 clap = { version = "4", features = ["cargo"] }
 chrono = { version = "0.4" }
+serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

@@ -12,6 +12,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "serde",
  "serde_yaml",
  "tokio",
 ]
