@@ -462,15 +462,33 @@ fn backend_uri(backend: &Uri, incoming: &Uri) -> Result<Uri, String> {
         .authority()
         .ok_or_else(|| "backend URI has no authority".to_string())?;
     let scheme = backend.scheme_str().unwrap_or("http");
-    let path_and_query = incoming
-        .path_and_query()
-        .map(|path| path.as_str())
-        .unwrap_or("/");
+    let base_path = backend.path().trim_end_matches("/");
+    let incoming_path = incoming.path();
+    let path = if incoming_path == "*" {
+        "*".to_owned()
+    } else if base_path.is_empty() || base_path == "/" {
+        incoming_path.to_owned()
+    } else if incoming_path == "/" {
+        format!("{base_path}/")
+    } else {
+        format!("{base_path}{incoming_path}")
+    };
+
+    let query = match (backend.query(), incoming.query()) {
+        (Some(base), Some(request)) => Some(format!("{base}&{request}")),
+        (Some(base), None) => Some(base.to_owned()),
+        (None, Some(request)) => Some(request.to_owned()),
+        (None, None) => None,
+    };
+    let path_and_query = match query {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
 
     Uri::builder()
         .scheme(scheme)
         .authority(authority.as_str())
-        .path_and_query(path_and_query)
+        .path_and_query(path_and_query.as_str())
         .build()
         .map_err(|err| err.to_string())
 }
@@ -517,9 +535,13 @@ async fn send_request(
             .parse()?,
     );
 
+    let request_target = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
     let mut request = Request::builder()
         .method(method.clone())
-        .uri(uri)
+        .uri(request_target)
         .version(version)
         .body(Full::new(body.clone()))?;
     *request.headers_mut() = forwarded_headers;
