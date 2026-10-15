@@ -8,7 +8,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{
+    combinators::{BoxBody, UnsyncBoxBody},
+    BodyExt, Full,
+};
 use hyper::body::{Body as HttpBody, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -31,7 +34,8 @@ use algos::weighted_round_robin::WeightedRoundRobin;
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
-type BackendClient = Client<HttpConnector, Full<Bytes>>;
+type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
+type BackendClient = Client<HttpConnector, RequestBody>;
 
 fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
     // takes Uri and returns SocketAddr
@@ -299,31 +303,30 @@ where
     T: Loadbalancer + ?Sized,
 {
     let (parts, body) = req.into_parts();
-    let body = match body.collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(err) => {
+    let body_is_empty = body.is_end_stream() && body.size_hint().exact() == Some(0);
+    let retryable = body_is_empty
+        && matches!(
+            parts.method.as_str(),
+            "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+        );
+    let mut request_body = Some(
+        body.map_err(|err| {
             eprintln!("Failed to read incoming request body: {err}");
-            return Ok(Response::builder()
-                .status(hyper::StatusCode::BAD_REQUEST)
-                .body(full_proxy_body(Bytes::from_static(b"Invalid request body")))
-                .expect("static response is valid"));
-        }
-    };
-
-    let retryable = matches!(
-        parts.method.as_str(),
-        "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
+            Box::new(err) as BoxError
+        })
+        .boxed_unsync(),
     );
     let mut attempted = HashSet::new();
     let mut last_failure = None;
 
     loop {
+        let body = request_body.take().unwrap_or_else(empty_request_body);
         match get_request(
             &parts.method,
             &parts.uri,
             parts.version,
             &parts.headers,
-            &body,
+            body,
             &mut attempted,
             Arc::clone(&lb),
             Arc::clone(&load_balancer),
@@ -480,12 +483,18 @@ fn full_proxy_body(bytes: Bytes) -> ProxyBody {
     Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
+fn empty_request_body() -> RequestBody {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
 async fn get_request<T>(
     method: &Method,
     incoming_uri: &Uri,
     version: Version,
     headers: &HeaderMap,
-    body: &Bytes,
+    body: RequestBody,
     attempted: &mut HashSet<usize>,
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
@@ -604,7 +613,7 @@ async fn send_request(
     method: &Method,
     version: Version,
     headers: &HeaderMap,
-    body: &Bytes,
+    body: RequestBody,
 ) -> Result<Response<Incoming>, BoxError> {
     let mut forwarded_headers = headers.clone();
     forwarded_headers.remove(hyper::header::CONNECTION);
@@ -627,7 +636,7 @@ async fn send_request(
         .method(method.clone())
         .uri(uri)
         .version(version)
-        .body(Full::new(body.clone()))?;
+        .body(body)?;
     *request.headers_mut() = forwarded_headers;
 
     let mut response = client.request(request).await?;
