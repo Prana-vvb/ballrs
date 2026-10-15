@@ -67,8 +67,9 @@ impl LoadBalancer {
     }
     fn update(&mut self, path: &str) -> io::Result<&LoadBalancer> {
         let config = config::load(path)?;
+        let algorithm = get_algo(&config.algorithm)?;
         self.load_balancer = config.load_balancer;
-        self.algo = get_algo(&config.algorithm);
+        self.algo = algorithm;
         self.servers = config
             .servers
             .into_iter()
@@ -113,14 +114,14 @@ fn cli(mut lb: LoadBalancer) -> Result<(), Box<dyn Error + Send + Sync>> {
         .arg_required_else_help(true)
         .about(
             r#"
- ________  ________  ___           ________  ________          
-|\   __  \|\   __  \|\  \         |\   __  \|\   ____\         
-\ \  \|\ /\ \  \|\  \ \  \        \ \  \|\  \ \  \___|_        
- \ \   __  \ \   __  \ \  \        \ \   _  _\ \_____  \       
-  \ \  \|\  \ \  \ \  \ \  \____  __\ \  \\  \\|____|\  \      
-   \ \_______\ \__\ \__\ \_______\\__\ \__\\ _\ ____\_\  \     
-    \|_______|\|__|\|__|\|_______\|__|\|__|\|__|\_________\    
-                                               \|_________|   
+ ________  ________  ___           ________  ________
+|\   __  \|\   __  \|\  \         |\   __  \|\   ____\
+\ \  \|\ /\ \  \|\  \ \  \        \ \  \|\  \ \  \___|_
+ \ \   __  \ \   __  \ \  \        \ \   _  _\ \_____  \
+  \ \  \|\  \ \  \ \  \ \  \____  __\ \  \\  \\|____|\  \
+   \ \_______\ \__\ \__\ \_______\\__\ \__\\ _\ ____\_\  \
+    \|_______|\|__|\|__|\|_______\|__|\|__|\|__|\_________\
+                                               \|_________|
 L7 Load Balancer Implemented in Rust 🦀
     "#,
         )
@@ -135,8 +136,8 @@ L7 Load Balancer Implemented in Rust 🦀
                 )
                 .arg(Arg::new("algorithm").short('a').long("algorithm").help(
                     "Starts load balancer with specified algorithm.
-Available algorithms: round_robin/rr, weighted_round_robin/wrr, least_connections/lc, 
-weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response_time/wlrc",
+Available algorithms: round_robin/rr, weighted_round_robin/wrr, least_connections/lc,
+weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response_time/wlrt",
                 ))
                 .arg(
                     Arg::new("path")
@@ -190,7 +191,7 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
             }
 
             if let Some(algorithm) = algorithm {
-                lb.algo = get_algo(algorithm);
+                lb.algo = get_algo(algorithm)?;
             }
 
             if let Some(report) = report {
@@ -214,16 +215,29 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
     Ok(())
 }
 
-fn get_algo(algo: &str) -> Algorithm {
-    match algo {
-        // "round_robin" => Algorithm::RoundRobin,
+fn get_algo(algo: &str) -> io::Result<Algorithm> {
+    let normalized = algo.trim().to_ascii_lowercase();
+    let algorithm = match normalized.as_str() {
+        "round_robin" | "rr" => Algorithm::RoundRobin,
         "weighted_round_robin" | "wrr" => Algorithm::WeightedRoundRobin,
         "least_connections" | "lc" => Algorithm::LeastConnections,
         "weighted_least_connections" | "wlc" => Algorithm::WeightedLeastConnections,
         "least_response_time" | "lrt" => Algorithm::LeastResponseTime,
         "weighted_least_response_time" | "wlrt" => Algorithm::WeightedLeastResponseTime,
-        _ => Algorithm::RoundRobin, // Default algorithms
-    }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported algorithm {algo:?}. Supported algorithms: round_robin/rr, \
+                     weighted_round_robin/wrr, least_connections/lc, \
+                     weighted_least_connections/wlc, least_response_time/lrt, \
+                     weighted_least_response_time/wlrc/wlrt"
+                ),
+            ));
+        }
+    };
+
+    Ok(algorithm)
 }
 
 fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
