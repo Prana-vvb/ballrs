@@ -1,18 +1,24 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::error::Error as StdError;
+use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::{Body as HttpBody, Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Bytes, HeaderMap, Method, Request, Response, Uri, Version};
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, timeout};
+use tokio::net::TcpListener;
+use tokio::time::{sleep, timeout, Instant as TokioInstant, Sleep};
 
 use crate::{Algorithm, LoadBalancer, Server};
 mod algos;
@@ -22,6 +28,10 @@ use algos::round_robin::RoundRobin;
 use algos::weighted_least_connections::WeightedLeastConnections;
 use algos::weighted_least_response_time::WeightedLeastResponseTime;
 use algos::weighted_round_robin::WeightedRoundRobin;
+
+type BoxError = Box<dyn StdError + Send + Sync>;
+type ProxyBody = BoxBody<Bytes, BoxError>;
+type BackendClient = Client<HttpConnector, Full<Bytes>>;
 
 fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
     // takes Uri and returns SocketAddr
@@ -40,6 +50,8 @@ fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
 pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // starts the load balancer
     let lb = Arc::new(Mutex::new(lb));
+    let backend_client: Arc<BackendClient> =
+        Arc::new(Client::builder(TokioExecutor::new()).build_http());
 
     let (health_check_interval, len, health_check_timeout, report, save, save_file) = {
         // gets health check interval and number of servers
@@ -205,32 +217,19 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
         lb_lock.algo.clone()
     };
 
-    match algo {
-        Algorithm::RoundRobin => {
-            let load_balancer = Arc::new(Mutex::new(RoundRobin::new()));
-            drop(listen(lb, load_balancer).await);
-        }
-        Algorithm::WeightedRoundRobin => {
-            let load_balancer = Arc::new(Mutex::new(WeightedRoundRobin::new()));
-            drop(listen(lb, load_balancer).await);
-        }
-        Algorithm::LeastConnections => {
-            let load_balancer = Arc::new(Mutex::new(LeastConnections::new()));
-            drop(listen(lb, load_balancer).await);
-        }
+    let load_balancer: Arc<Mutex<dyn Loadbalancer>> = match algo {
+        Algorithm::RoundRobin => Arc::new(Mutex::new(RoundRobin::new())),
+        Algorithm::WeightedRoundRobin => Arc::new(Mutex::new(WeightedRoundRobin::new())),
+        Algorithm::LeastConnections => Arc::new(Mutex::new(LeastConnections::new())),
         Algorithm::WeightedLeastConnections => {
-            let load_balancer = Arc::new(Mutex::new(WeightedLeastConnections::new()));
-            drop(listen(lb, load_balancer).await);
+            Arc::new(Mutex::new(WeightedLeastConnections::new()))
         }
-        Algorithm::LeastResponseTime => {
-            let load_balancer = Arc::new(Mutex::new(LeastResponseTime::new()));
-            drop(listen(lb, load_balancer).await);
-        }
+        Algorithm::LeastResponseTime => Arc::new(Mutex::new(LeastResponseTime::new())),
         Algorithm::WeightedLeastResponseTime => {
-            let load_balancer = Arc::new(Mutex::new(WeightedLeastResponseTime::new()));
-            drop(listen(lb, load_balancer).await);
+            Arc::new(Mutex::new(WeightedLeastResponseTime::new()))
         }
-    }
+    };
+    listen(lb, load_balancer, Arc::clone(&backend_client)).await?;
 
     Ok(())
 }
@@ -238,9 +237,10 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
 async fn listen<T>(
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
+    backend_client: Arc<BackendClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    T: Loadbalancer + Send + 'static,
+    T: Loadbalancer + ?Sized + 'static,
 {
     let addr = uri_to_socket_addr(&lb.lock().unwrap().load_balancer).unwrap();
     let listener = match TcpListener::bind(addr).await {
@@ -265,15 +265,20 @@ where
 
         let lb_clone = Arc::clone(&lb);
         let load_balancer_clone = Arc::clone(&load_balancer);
+        let backend_client = Arc::clone(&backend_client);
 
-        // !!!!!!!!!! idk smtg virtual thread thing should go down here
         tokio::task::spawn(async move {
             // spawns a tokio task to server multiple connections concurrently
             if let Err(err) = http1::Builder::new()
                 .serve_connection(
                     io,
                     service_fn(move |req| {
-                        handle_request(req, Arc::clone(&lb_clone), Arc::clone(&load_balancer_clone))
+                        handle_request(
+                            req,
+                            Arc::clone(&lb_clone),
+                            Arc::clone(&load_balancer_clone),
+                            Arc::clone(&backend_client),
+                        )
                     }),
                 )
                 .await
@@ -283,13 +288,15 @@ where
         });
     }
 }
+
 async fn handle_request<T>(
-    req: Request<hyper::body::Incoming>,
+    req: Request<Incoming>,
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
-) -> Result<Response<Full<Bytes>>, Infallible>
+    backend_client: Arc<BackendClient>,
+) -> Result<Response<ProxyBody>, Infallible>
 where
-    T: Loadbalancer,
+    T: Loadbalancer + ?Sized,
 {
     let (parts, body) = req.into_parts();
     let body = match body.collect().await {
@@ -298,7 +305,7 @@ where
             eprintln!("Failed to read incoming request body: {err}");
             return Ok(Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from_static(b"Invalid request body")))
+                .body(full_proxy_body(Bytes::from_static(b"Invalid request body")))
                 .expect("static response is valid"));
         }
     };
@@ -320,6 +327,7 @@ where
             &mut attempted,
             Arc::clone(&lb),
             Arc::clone(&load_balancer),
+            Arc::clone(&backend_client),
         )
         .await
         {
@@ -351,7 +359,7 @@ enum ProxyFailure {
     GatewayTimeout,
 }
 
-fn failure_response(failure: ProxyFailure) -> Response<Full<Bytes>> {
+fn failure_response(failure: ProxyFailure) -> Response<ProxyBody> {
     let (status, message) = match failure {
         ProxyFailure::NoBackend => (
             hyper::StatusCode::SERVICE_UNAVAILABLE,
@@ -369,8 +377,107 @@ fn failure_response(failure: ProxyFailure) -> Response<Full<Bytes>> {
 
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::from_static(message.as_bytes())))
+        .body(full_proxy_body(Bytes::from_static(message.as_bytes())))
         .expect("static proxy error response is valid")
+}
+
+struct ConnectionGuard {
+    lb: Arc<Mutex<LoadBalancer>>,
+    index: usize,
+    started_at: Instant,
+}
+
+impl ConnectionGuard {
+    fn mark_failed(&self) {
+        if let Ok(mut lb) = self.lb.lock() {
+            if let Some(server) = lb.servers.get_mut(self.index) {
+                server.alive = false;
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut lb) = self.lb.lock() {
+            if let Some(server) = lb.servers.get_mut(self.index) {
+                server.connections = server.connections.saturating_sub(1);
+                server.response_time = self.started_at.elapsed();
+            }
+        }
+    }
+}
+
+struct StreamingBody {
+    inner: Option<Pin<Box<Incoming>>>,
+    deadline: Pin<Box<Sleep>>,
+    connection: Option<ConnectionGuard>,
+}
+
+impl StreamingBody {
+    fn new(body: Incoming, deadline: TokioInstant, connection: ConnectionGuard) -> Self {
+        Self {
+            inner: Some(Box::pin(body)),
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            connection: Some(connection),
+        }
+    }
+
+    fn finish(&mut self, failed: bool) {
+        self.inner.take();
+        if failed {
+            if let Some(connection) = &self.connection {
+                connection.mark_failed();
+            }
+        }
+        self.connection.take();
+    }
+}
+
+impl HttpBody for StreamingBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.inner.is_none() {
+            return Poll::Ready(None);
+        }
+
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            this.finish(true);
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend response body timed out",
+            )))));
+        }
+
+        let frame = this
+            .inner
+            .as_mut()
+            .expect("body checked above")
+            .as_mut()
+            .poll_frame(cx);
+        match frame {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(error))) => {
+                this.finish(true);
+                Poll::Ready(Some(Err(Box::new(error))))
+            }
+            Poll::Ready(None) => {
+                this.finish(false);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn full_proxy_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
 async fn get_request<T>(
@@ -382,9 +489,10 @@ async fn get_request<T>(
     attempted: &mut HashSet<usize>,
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
-) -> Result<Response<Full<Bytes>>, ProxyFailure>
+    backend_client: Arc<BackendClient>,
+) -> Result<Response<ProxyBody>, ProxyFailure>
 where
-    T: Loadbalancer,
+    T: Loadbalancer + ?Sized,
 {
     let (timeout_duration, index, uri) = {
         let mut lb = lb.lock().unwrap();
@@ -423,35 +531,32 @@ where
         )
     };
 
-    let start = Instant::now();
-
-    let data = timeout(
+    let started_at = Instant::now();
+    let deadline = TokioInstant::now() + timeout_duration;
+    let connection = ConnectionGuard {
+        lb: Arc::clone(&lb),
+        index,
+        started_at,
+    };
+    let response = timeout(
         timeout_duration,
-        send_request(uri, method, version, headers, body),
+        send_request(backend_client.as_ref(), uri, method, version, headers, body),
     )
     .await;
 
-    let duration = start.elapsed();
-
-    let mut lb = lb.lock().unwrap();
-
-    lb.servers[index].response_time = duration;
-
-    if lb.servers[index].connections > 0 {
-        lb.servers[index].connections -= 1;
-    }
-
-    match data {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(err)) => {
-            eprintln!("Backend request failed: {err}");
-            lb.servers[index].connections = 0;
-            lb.servers[index].alive = false;
+    match response {
+        Ok(Ok(response)) => {
+            let (parts, body) = response.into_parts();
+            let body = StreamingBody::new(body, deadline, connection).boxed();
+            Ok(Response::from_parts(parts, body))
+        }
+        Ok(Err(error)) => {
+            eprintln!("Backend request failed: {error}");
+            connection.mark_failed();
             Err(ProxyFailure::BadGateway)
         }
         Err(_) => {
-            lb.servers[index].connections = 0;
-            lb.servers[index].alive = false;
+            connection.mark_failed();
             Err(ProxyFailure::GatewayTimeout)
         }
     }
@@ -494,30 +599,13 @@ fn backend_uri(backend: &Uri, incoming: &Uri) -> Result<Uri, String> {
 }
 
 async fn send_request(
+    client: &BackendClient,
     uri: Uri,
     method: &Method,
     version: Version,
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
-    let host = uri.host().ok_or("backend URI has no host")?;
-    let port = uri.port_u16().unwrap_or(80);
-    let address = if host.contains(':') {
-        format!("[{}]:{}", host, port)
-    } else {
-        format!("{}:{}", host, port)
-    };
-
-    let stream = TcpStream::connect(address).await?;
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            eprintln!("Backend connection failed: {err}");
-        }
-    });
-
+) -> Result<Response<Incoming>, BoxError> {
     let mut forwarded_headers = headers.clone();
     forwarded_headers.remove(hyper::header::CONNECTION);
     forwarded_headers.remove(hyper::header::HeaderName::from_static("keep-alive"));
@@ -535,23 +623,14 @@ async fn send_request(
             .parse()?,
     );
 
-    let request_target = uri
-        .path_and_query()
-        .map(|path| path.as_str())
-        .unwrap_or("/");
     let mut request = Request::builder()
         .method(method.clone())
-        .uri(request_target)
+        .uri(uri)
         .version(version)
         .body(Full::new(body.clone()))?;
     *request.headers_mut() = forwarded_headers;
 
-    let response = sender.send_request(request).await?;
-    let (parts, body) = response.into_parts();
-    let body = body.collect().await?.to_bytes();
-    let mut response = Response::from_parts(parts, Full::new(body));
-
-    // The client connection is not reused; remove hop-by-hop response headers.
+    let mut response = client.request(request).await?;
     response.headers_mut().remove(hyper::header::CONNECTION);
     response
         .headers_mut()
@@ -572,6 +651,6 @@ async fn send_request(
     Ok(response)
 }
 
-pub trait Loadbalancer {
+pub trait Loadbalancer: Send {
     fn get_index(&mut self, lb: &[&Server]) -> Option<usize>;
 }
