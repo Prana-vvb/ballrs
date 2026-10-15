@@ -20,6 +20,7 @@ pub(crate) struct Config {
     pub(crate) algorithm: String,
     pub(crate) servers: Vec<ServerConfig>,
     pub(crate) timeout: Duration,
+    pub(crate) client_upload_timeout: Duration,
     pub(crate) health_check_timeout: Duration,
     pub(crate) health_check_interval: Duration,
 }
@@ -77,6 +78,8 @@ struct RawConfig {
     #[serde(rename = "max connections")]
     max_connections: Option<RawList<u32>>,
     timeout: u64,
+    #[serde(rename = "client upload timeout")]
+    client_upload_timeout: Option<u64>,
     #[serde(rename = "server timeouts")]
     server_timeouts: Option<RawList<RawServerTimeout>>,
     #[serde(rename = "health check timeout")]
@@ -94,6 +97,7 @@ impl Default for RawConfig {
             weights: None,
             max_connections: None,
             timeout: 0,
+            client_upload_timeout: None,
             server_timeouts: None,
             health_check_timeout: None,
             health_check_interval: 0,
@@ -166,11 +170,20 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
         .collect();
 
     let timeout = Duration::from_secs(raw.timeout);
+    let client_upload_timeout = raw.client_upload_timeout.unwrap_or(60);
+    if client_upload_timeout == 0 {
+        return Err(invalid_value(
+            "client upload timeout",
+            "0",
+            "must be greater than zero",
+        ));
+    }
     Ok(Config {
         load_balancer,
         algorithm: raw.algorithm,
         servers,
         timeout,
+        client_upload_timeout: Duration::from_secs(client_upload_timeout),
         health_check_timeout: Duration::from_secs(raw.health_check_timeout.unwrap_or(raw.timeout)),
         health_check_interval: Duration::from_secs(raw.health_check_interval),
     })

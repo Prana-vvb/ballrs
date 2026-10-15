@@ -12,6 +12,7 @@ struct LoadBalancer {
     algo: Algorithm,
     servers: Vec<Server>,
     timeout: Duration,
+    client_upload_timeout: Duration,
     health_check_timeout: Duration,
     health_check_interval: Duration,
     report: bool,
@@ -58,6 +59,7 @@ impl LoadBalancer {
             algo: Algorithm::RoundRobin, // using round robin as default algorithm
             servers: Vec::new(),
             timeout: Duration::from_secs(0),
+            client_upload_timeout: Duration::from_secs(60),
             health_check_timeout: Duration::from_secs(0),
             health_check_interval: Duration::from_secs(0),
             report: true,
@@ -83,6 +85,7 @@ impl LoadBalancer {
             })
             .collect();
         self.timeout = config.timeout;
+        self.client_upload_timeout = config.client_upload_timeout;
         self.health_check_timeout = config.health_check_timeout;
         self.health_check_interval = config.health_check_interval;
 
@@ -279,13 +282,14 @@ fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     let config = format!(
-        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nserver timeouts: {}\nhealth check timeout: {}\nhealth check interval: {}\n",
+        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nclient upload timeout: {}\nserver timeouts: {}\nhealth check timeout: {}\nhealth check interval: {}\n",
         lb.load_balancer,
         algorithm,
         servers,
         weights,
         max_connections,
         lb.timeout.as_secs(),
+        lb.client_upload_timeout.as_secs(),
         server_timeouts,
         lb.health_check_timeout.as_secs(),
         lb.health_check_interval.as_secs(),

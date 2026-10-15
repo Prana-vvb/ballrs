@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -12,7 +13,7 @@ use http_body_util::{
     combinators::{BoxBody, UnsyncBoxBody},
     BodyExt, Full,
 };
-use hyper::body::{Body as HttpBody, Frame, Incoming};
+use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Bytes, HeaderMap, Method, Request, Response, Uri, Version};
@@ -21,6 +22,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout, Instant as TokioInstant, Sleep};
 
 use crate::{Algorithm, LoadBalancer, Server};
@@ -36,6 +38,115 @@ type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
 type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
 type BackendClient = Client<HttpConnector, RequestBody>;
+
+const UPLOAD_ACTIVE: u8 = 0;
+const UPLOAD_COMPLETE: u8 = 1;
+const UPLOAD_READ_FAILED: u8 = 2;
+const UPLOAD_TIMED_OUT: u8 = 3;
+
+struct MonitoredRequestBody {
+    inner: Pin<Box<RequestBody>>,
+    idle_deadline: Pin<Box<Sleep>>,
+    idle_timeout: Duration,
+    has_started: bool,
+    state: Arc<AtomicU8>,
+    started_signal: Option<oneshot::Sender<()>>,
+    completion: Option<oneshot::Sender<Option<Instant>>>,
+}
+
+impl MonitoredRequestBody {
+    fn new(
+        inner: RequestBody,
+        idle_timeout: Duration,
+        state: Arc<AtomicU8>,
+        started_signal: oneshot::Sender<()>,
+        completion: oneshot::Sender<Option<Instant>>,
+    ) -> Self {
+        let already_complete = inner.is_end_stream();
+        let started_at = already_complete.then(Instant::now);
+        let mut started_signal = Some(started_signal);
+        let mut completion = Some(completion);
+        if already_complete {
+            state.store(UPLOAD_COMPLETE, Ordering::Release);
+            if let Some(signal) = started_signal.take() {
+                let _ = signal.send(());
+            }
+            if let Some(signal) = completion.take() {
+                let _ = signal.send(started_at);
+            }
+        }
+        Self {
+            inner: Box::pin(inner),
+            idle_deadline: Box::pin(tokio::time::sleep(idle_timeout)),
+            idle_timeout,
+            has_started: already_complete,
+            state,
+            started_signal,
+            completion,
+        }
+    }
+
+    fn finish(&mut self, state: u8, completed_at: Option<Instant>) {
+        self.state.store(state, Ordering::Release);
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(completed_at);
+        }
+    }
+}
+
+impl HttpBody for MonitoredRequestBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if !this.has_started {
+            this.has_started = true;
+            this.idle_deadline
+                .as_mut()
+                .reset(TokioInstant::now() + this.idle_timeout);
+            if let Some(started_signal) = this.started_signal.take() {
+                let _ = started_signal.send(());
+            }
+        }
+        if this.idle_deadline.as_mut().poll(cx).is_ready() {
+            this.finish(UPLOAD_TIMED_OUT, None);
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client request body upload timed out",
+            )))));
+        }
+
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                this.idle_deadline
+                    .as_mut()
+                    .reset(TokioInstant::now() + this.idle_timeout);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.finish(UPLOAD_READ_FAILED, None);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.finish(UPLOAD_COMPLETE, Some(Instant::now()));
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
     // takes Uri and returns SocketAddr
@@ -54,8 +165,9 @@ fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
 pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // starts the load balancer
     let lb = Arc::new(Mutex::new(lb));
+    let connector = HttpConnector::new();
     let backend_client: Arc<BackendClient> =
-        Arc::new(Client::builder(TokioExecutor::new()).build_http());
+        Arc::new(Client::builder(TokioExecutor::new()).build(connector));
 
     let (health_check_interval, len, health_check_timeout, report, save, save_file) = {
         // gets health check interval and number of servers
@@ -341,7 +453,12 @@ where
                 ));
             }
             Err(failure) => {
-                if !retryable {
+                if !retryable
+                    || matches!(
+                        failure,
+                        ProxyFailure::BadRequestBody | ProxyFailure::ClientUploadTimeout
+                    )
+                {
                     return Ok(failure_response(failure));
                 }
                 last_failure = Some(match (last_failure, failure) {
@@ -360,6 +477,15 @@ enum ProxyFailure {
     NoBackend,
     BadGateway,
     GatewayTimeout,
+    BadRequestBody,
+    ClientUploadTimeout,
+}
+
+enum SendFailure {
+    Backend(BoxError),
+    BackendTimeout,
+    ClientBody,
+    ClientUploadTimeout,
 }
 
 fn failure_response(failure: ProxyFailure) -> Response<ProxyBody> {
@@ -376,6 +502,14 @@ fn failure_response(failure: ProxyFailure) -> Response<ProxyBody> {
             hyper::StatusCode::GATEWAY_TIMEOUT,
             "Backend request timed out",
         ),
+        ProxyFailure::BadRequestBody => (
+            hyper::StatusCode::BAD_REQUEST,
+            "Failed to read request body",
+        ),
+        ProxyFailure::ClientUploadTimeout => (
+            hyper::StatusCode::REQUEST_TIMEOUT,
+            "Client request body upload timed out",
+        ),
     };
 
     Response::builder()
@@ -387,7 +521,7 @@ fn failure_response(failure: ProxyFailure) -> Response<ProxyBody> {
 struct ConnectionGuard {
     lb: Arc<Mutex<LoadBalancer>>,
     index: usize,
-    started_at: Instant,
+    started_at: Option<Instant>,
 }
 
 impl ConnectionGuard {
@@ -405,7 +539,9 @@ impl Drop for ConnectionGuard {
         if let Ok(mut lb) = self.lb.lock() {
             if let Some(server) = lb.servers.get_mut(self.index) {
                 server.connections = server.connections.saturating_sub(1);
-                server.response_time = self.started_at.elapsed();
+                if let Some(started_at) = self.started_at {
+                    server.response_time = started_at.elapsed();
+                }
             }
         }
     }
@@ -503,7 +639,7 @@ async fn get_request<T>(
 where
     T: Loadbalancer + ?Sized,
 {
-    let (timeout_duration, index, uri) = {
+    let (timeout_duration, client_upload_timeout, index, uri) = {
         let mut lb = lb.lock().unwrap();
 
         let eligible: Vec<(usize, &Server)> = lb
@@ -535,39 +671,47 @@ where
         lb.servers[index].connections_served += 1;
         (
             lb.servers[index].request_timeout.unwrap_or(lb.timeout),
+            lb.client_upload_timeout,
             index,
             uri,
         )
     };
 
-    let started_at = Instant::now();
-    let deadline = TokioInstant::now() + timeout_duration;
-    let connection = ConnectionGuard {
+    let mut connection = ConnectionGuard {
         lb: Arc::clone(&lb),
         index,
-        started_at,
+        started_at: None,
     };
-    let response = timeout(
+    match send_request(
+        backend_client.as_ref(),
+        uri,
+        method,
+        version,
+        headers,
+        body,
         timeout_duration,
-        send_request(backend_client.as_ref(), uri, method, version, headers, body),
+        client_upload_timeout,
     )
-    .await;
-
-    match response {
-        Ok(Ok(response)) => {
+    .await
+    {
+        Ok((response, backend_started_at)) => {
+            connection.started_at = Some(backend_started_at);
+            let deadline = TokioInstant::from_std(backend_started_at + timeout_duration);
             let (parts, body) = response.into_parts();
             let body = StreamingBody::new(body, deadline, connection).boxed();
             Ok(Response::from_parts(parts, body))
         }
-        Ok(Err(error)) => {
+        Err(SendFailure::Backend(error)) => {
             eprintln!("Backend request failed: {error}");
             connection.mark_failed();
             Err(ProxyFailure::BadGateway)
         }
-        Err(_) => {
+        Err(SendFailure::BackendTimeout) => {
             connection.mark_failed();
             Err(ProxyFailure::GatewayTimeout)
         }
+        Err(SendFailure::ClientBody) => Err(ProxyFailure::BadRequestBody),
+        Err(SendFailure::ClientUploadTimeout) => Err(ProxyFailure::ClientUploadTimeout),
     }
 }
 
@@ -614,7 +758,21 @@ async fn send_request(
     version: Version,
     headers: &HeaderMap,
     body: RequestBody,
-) -> Result<Response<Incoming>, BoxError> {
+    response_timeout: Duration,
+    upload_idle_timeout: Duration,
+) -> Result<(Response<Incoming>, Instant), SendFailure> {
+    let upload_state = Arc::new(AtomicU8::new(UPLOAD_ACTIVE));
+    let (upload_started_tx, mut upload_started_rx) = oneshot::channel();
+    let (upload_completed_tx, mut upload_completed_rx) = oneshot::channel();
+    let body = MonitoredRequestBody::new(
+        body,
+        upload_idle_timeout,
+        Arc::clone(&upload_state),
+        upload_started_tx,
+        upload_completed_tx,
+    )
+    .boxed_unsync();
+
     let mut forwarded_headers = headers.clone();
     forwarded_headers.remove(hyper::header::CONNECTION);
     forwarded_headers.remove(hyper::header::HeaderName::from_static("keep-alive"));
@@ -624,22 +782,70 @@ async fn send_request(
     forwarded_headers.remove(hyper::header::TRAILER);
     forwarded_headers.remove(hyper::header::TRANSFER_ENCODING);
     forwarded_headers.remove(hyper::header::UPGRADE);
-    forwarded_headers.insert(
-        hyper::header::HOST,
-        uri.authority()
-            .ok_or("backend URI has no authority")?
-            .as_str()
-            .parse()?,
-    );
+    let authority = uri.authority().ok_or_else(|| {
+        SendFailure::Backend(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backend URI has no authority",
+        )))
+    })?;
+    let host = authority
+        .as_str()
+        .parse()
+        .map_err(|error| SendFailure::Backend(Box::new(error)))?;
+    forwarded_headers.insert(hyper::header::HOST, host);
 
     let mut request = Request::builder()
         .method(method.clone())
         .uri(uri)
         .version(version)
-        .body(body)?;
+        .body(body)
+        .map_err(|error| SendFailure::Backend(Box::new(error)))?;
     *request.headers_mut() = forwarded_headers;
 
-    let mut response = client.request(request).await?;
+    let mut request_future = Box::pin(client.request(request));
+    let mut upload_completed_at = None;
+    let mut connect_deadline = Box::pin(tokio::time::sleep(response_timeout));
+    let response = tokio::select! {
+        result = &mut request_future => {
+            classify_client_result(result, upload_state.load(Ordering::Acquire))?
+        }
+        _ = &mut upload_started_rx => {
+            tokio::select! {
+                result = &mut request_future => {
+                    classify_client_result(result, upload_state.load(Ordering::Acquire))?
+                }
+                completed = &mut upload_completed_rx => {
+                    match completed {
+                        Ok(Some(completed_at)) => {
+                            upload_completed_at = Some(completed_at);
+                            match timeout(response_timeout, &mut request_future).await {
+                                Ok(result) => classify_client_result(
+                                    result,
+                                    upload_state.load(Ordering::Acquire),
+                                )?,
+                                Err(_) => return Err(SendFailure::BackendTimeout),
+                            }
+                        }
+                        Ok(None) => return Err(classify_upload_state(
+                            upload_state.load(Ordering::Acquire),
+                        )),
+                        Err(_) => match timeout(response_timeout, &mut request_future).await {
+                            Ok(result) => classify_client_result(
+                                result,
+                                upload_state.load(Ordering::Acquire),
+                            )?,
+                            Err(_) => return Err(SendFailure::BackendTimeout),
+                        },
+                    }
+                }
+            }
+        }
+        _ = connect_deadline.as_mut() => return Err(SendFailure::BackendTimeout),
+    };
+    let mut response = response;
+    let backend_started_at = upload_completed_at
+        .or_else(|| upload_completed_rx.try_recv().ok().flatten())
+        .unwrap_or_else(Instant::now);
     response.headers_mut().remove(hyper::header::CONNECTION);
     response
         .headers_mut()
@@ -657,7 +863,29 @@ async fn send_request(
         .remove(hyper::header::TRANSFER_ENCODING);
     response.headers_mut().remove(hyper::header::UPGRADE);
 
-    Ok(response)
+    Ok((response, backend_started_at))
+}
+
+fn classify_client_result(
+    result: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
+    upload_state: u8,
+) -> Result<Response<Incoming>, SendFailure> {
+    result.map_err(|error| match upload_state {
+        UPLOAD_READ_FAILED => SendFailure::ClientBody,
+        UPLOAD_TIMED_OUT => SendFailure::ClientUploadTimeout,
+        _ => SendFailure::Backend(Box::new(error)),
+    })
+}
+
+fn classify_upload_state(upload_state: u8) -> SendFailure {
+    match upload_state {
+        UPLOAD_READ_FAILED => SendFailure::ClientBody,
+        UPLOAD_TIMED_OUT => SendFailure::ClientUploadTimeout,
+        _ => SendFailure::Backend(Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "request body ended before completion",
+        ))),
+    }
 }
 
 pub trait Loadbalancer: Send {

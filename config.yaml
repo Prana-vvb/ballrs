@@ -19,6 +19,9 @@ max connections: 1000, 1000, 1000
 # max server response time (in s)
 timeout: 10
 
+# max idle time while receiving a client request body (in s)
+client upload timeout: 60
+
 # request timeout overrides in server-list order
 # use 'default' for global timeout
 server timeouts: default, default, default
