@@ -362,11 +362,11 @@ where
     let listener = match TcpListener::bind(addr).await {
         // We create a TcpListener and bind it to load balancer address
         Ok(listener) => {
-            println!("Load balancer is running on http://{}", addr);
+            tracing::info!(%addr, "Load balancer is running");
             listener
         }
         Err(err) => {
-            eprintln!("{}", err);
+            tracing::error!(error = %err, "Failed to bind load balancer listener");
             return Ok(());
         }
     };
@@ -399,7 +399,7 @@ where
                 )
                 .await
             {
-                eprintln!("Error serving connection: {:?}", err);
+                tracing::error!(error = %err, "Error serving downstream connection");
             }
         });
     }
@@ -414,6 +414,14 @@ async fn handle_request<T>(
 where
     T: Loadbalancer + ?Sized,
 {
+    let request_started_at = Instant::now();
+    let request_span = tracing::info_span!(
+        "http.request",
+        method = %req.method(),
+        path = %req.uri().path(),
+        backend_index = tracing::field::Empty,
+        status = tracing::field::Empty,
+    );
     let (parts, body) = req.into_parts();
     let body_is_empty = body.is_end_stream() && body.size_hint().exact() == Some(0);
     let retryable = body_is_empty
@@ -422,10 +430,12 @@ where
             "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
         );
     let mut request_body = Some(
-        body.map_err(|err| {
-            eprintln!("Failed to read incoming request body: {err}");
+        body.map_err({
+            let request_span = request_span.clone();
+            move |err| {
+                tracing::warn!(parent: &request_span, outcome = "client_upload_failed", "Failed to read incoming request body");
             Box::new(err) as BoxError
-        })
+        }})
         .boxed_unsync(),
     );
     let mut attempted = HashSet::new();
@@ -443,14 +453,21 @@ where
             Arc::clone(&lb),
             Arc::clone(&load_balancer),
             Arc::clone(&backend_client),
+            request_span.clone(),
+            request_started_at,
         )
         .await
         {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                request_span.record("status", response.status().as_u16());
+                return Ok(response);
+            }
             Err(ProxyFailure::NoBackend) => {
-                return Ok(failure_response(
-                    last_failure.unwrap_or(ProxyFailure::NoBackend),
-                ));
+                let failure = last_failure.unwrap_or(ProxyFailure::NoBackend);
+                let response = failure_response(failure);
+                request_span.record("status", response.status().as_u16());
+                tracing::warn!(parent: &request_span, outcome = "proxy_failed", status = response.status().as_u16(), "Request could not be sent to a backend");
+                return Ok(response);
             }
             Err(failure) => {
                 if !retryable
@@ -459,7 +476,10 @@ where
                         ProxyFailure::BadRequestBody | ProxyFailure::ClientUploadTimeout
                     )
                 {
-                    return Ok(failure_response(failure));
+                    let response = failure_response(failure);
+                    request_span.record("status", response.status().as_u16());
+                    tracing::warn!(parent: &request_span, outcome = "proxy_failed", status = response.status().as_u16(), "Request could not be completed");
+                    return Ok(response);
                 }
                 last_failure = Some(match (last_failure, failure) {
                     (Some(ProxyFailure::GatewayTimeout), _) | (_, ProxyFailure::GatewayTimeout) => {
@@ -482,7 +502,7 @@ enum ProxyFailure {
 }
 
 enum SendFailure {
-    Backend(BoxError),
+    Backend,
     BackendTimeout,
     ClientBody,
     ClientUploadTimeout,
@@ -551,25 +571,54 @@ struct StreamingBody {
     inner: Option<Pin<Box<Incoming>>>,
     deadline: Pin<Box<Sleep>>,
     connection: Option<ConnectionGuard>,
+    request_span: tracing::Span,
+    request_started_at: Instant,
 }
 
 impl StreamingBody {
-    fn new(body: Incoming, deadline: TokioInstant, connection: ConnectionGuard) -> Self {
+    fn new(
+        body: Incoming,
+        deadline: TokioInstant,
+        connection: ConnectionGuard,
+        request_span: tracing::Span,
+        request_started_at: Instant,
+    ) -> Self {
         Self {
             inner: Some(Box::pin(body)),
             deadline: Box::pin(tokio::time::sleep_until(deadline)),
             connection: Some(connection),
+            request_span,
+            request_started_at,
         }
     }
 
     fn finish(&mut self, failed: bool) {
         self.inner.take();
+        let elapsed_ms = self.request_started_at.elapsed().as_millis() as u64;
+        if failed {
+            tracing::warn!(parent: &self.request_span, outcome = "response_stream_failed", elapsed_ms, "Backend response stream failed");
+        } else {
+            tracing::info!(parent: &self.request_span, outcome = "complete", elapsed_ms, "Request completed");
+        }
         if failed {
             if let Some(connection) = &self.connection {
                 connection.mark_failed();
             }
         }
         self.connection.take();
+    }
+}
+
+impl Drop for StreamingBody {
+    fn drop(&mut self) {
+        if self.connection.is_some() {
+            tracing::warn!(
+                parent: &self.request_span,
+                outcome = "downstream_cancelled",
+                elapsed_ms = self.request_started_at.elapsed().as_millis() as u64,
+                "Downstream stopped reading the response"
+            );
+        }
     }
 }
 
@@ -601,7 +650,16 @@ impl HttpBody for StreamingBody {
             .as_mut()
             .poll_frame(cx);
         match frame {
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Ok(frame))) => {
+                let end_stream = this
+                    .inner
+                    .as_ref()
+                    .is_some_and(|body| body.as_ref().get_ref().is_end_stream());
+                if end_stream {
+                    this.finish(false);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Ready(Some(Err(error))) => {
                 this.finish(true);
                 Poll::Ready(Some(Err(Box::new(error))))
@@ -635,6 +693,8 @@ async fn get_request<T>(
     lb: Arc<Mutex<LoadBalancer>>,
     load_balancer: Arc<Mutex<T>>,
     backend_client: Arc<BackendClient>,
+    request_span: tracing::Span,
+    request_started_at: Instant,
 ) -> Result<Response<ProxyBody>, ProxyFailure>
 where
     T: Loadbalancer + ?Sized,
@@ -663,6 +723,7 @@ where
             return Err(ProxyFailure::NoBackend);
         };
         let index = *index;
+        request_span.record("backend_index", index + 1);
         let backend = server.addr.clone();
         attempted.insert(index);
         let uri = backend_uri(&backend, incoming_uri).map_err(|_| ProxyFailure::BadGateway)?;
@@ -698,11 +759,13 @@ where
             connection.started_at = Some(backend_started_at);
             let deadline = TokioInstant::from_std(backend_started_at + timeout_duration);
             let (parts, body) = response.into_parts();
-            let body = StreamingBody::new(body, deadline, connection).boxed();
+            let body =
+                StreamingBody::new(body, deadline, connection, request_span, request_started_at)
+                    .boxed();
             Ok(Response::from_parts(parts, body))
         }
-        Err(SendFailure::Backend(error)) => {
-            eprintln!("Backend request failed: {error}");
+        Err(SendFailure::Backend) => {
+            tracing::error!(parent: &request_span, outcome = "backend_request_failed", "Backend request failed");
             connection.mark_failed();
             Err(ProxyFailure::BadGateway)
         }
@@ -782,16 +845,11 @@ async fn send_request(
     forwarded_headers.remove(hyper::header::TRAILER);
     forwarded_headers.remove(hyper::header::TRANSFER_ENCODING);
     forwarded_headers.remove(hyper::header::UPGRADE);
-    let authority = uri.authority().ok_or_else(|| {
-        SendFailure::Backend(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "backend URI has no authority",
-        )))
-    })?;
+    let authority = uri.authority().ok_or(SendFailure::Backend)?;
     let host = authority
         .as_str()
         .parse()
-        .map_err(|error| SendFailure::Backend(Box::new(error)))?;
+        .map_err(|_| SendFailure::Backend)?;
     forwarded_headers.insert(hyper::header::HOST, host);
 
     let mut request = Request::builder()
@@ -799,7 +857,7 @@ async fn send_request(
         .uri(uri)
         .version(version)
         .body(body)
-        .map_err(|error| SendFailure::Backend(Box::new(error)))?;
+        .map_err(|_| SendFailure::Backend)?;
     *request.headers_mut() = forwarded_headers;
 
     let mut request_future = Box::pin(client.request(request));
@@ -870,10 +928,10 @@ fn classify_client_result(
     result: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
     upload_state: u8,
 ) -> Result<Response<Incoming>, SendFailure> {
-    result.map_err(|error| match upload_state {
+    result.map_err(|_| match upload_state {
         UPLOAD_READ_FAILED => SendFailure::ClientBody,
         UPLOAD_TIMED_OUT => SendFailure::ClientUploadTimeout,
-        _ => SendFailure::Backend(Box::new(error)),
+        _ => SendFailure::Backend,
     })
 }
 
@@ -881,10 +939,7 @@ fn classify_upload_state(upload_state: u8) -> SendFailure {
     match upload_state {
         UPLOAD_READ_FAILED => SendFailure::ClientBody,
         UPLOAD_TIMED_OUT => SendFailure::ClientUploadTimeout,
-        _ => SendFailure::Backend(Box::new(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "request body ended before completion",
-        ))),
+        _ => SendFailure::Backend,
     }
 }
 

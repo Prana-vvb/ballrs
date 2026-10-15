@@ -104,6 +104,13 @@ enum Algorithm {
 }
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init()?;
+
     let mut lb = LoadBalancer::new();
     lb.update("config.yaml")?;
 
@@ -174,7 +181,7 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
 
     match res.subcommand_name() {
         Some("start") => {
-            println!("Starting load balancer");
+            tracing::info!("Starting load balancer");
             let start_args = res.subcommand_matches("start").unwrap();
             let path = start_args.get_one::<String>("path");
             let address = start_args.get_one::<String>("address");
