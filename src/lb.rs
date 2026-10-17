@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::future::Future;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -21,9 +20,10 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::time::{sleep, timeout, Instant as TokioInstant, Sleep};
+use tokio::time::{timeout, Instant as TokioInstant, Sleep};
 
 use crate::{Algorithm, LoadBalancer, Server};
 mod algos;
@@ -38,6 +38,156 @@ type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
 type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
 type BackendClient = Client<HttpConnector, RequestBody>;
+
+struct ReportSnapshot {
+    health_check: u32,
+    probe_interval: Duration,
+    servers: Vec<ServerReportSnapshot>,
+}
+
+struct ServerReportSnapshot {
+    addr: Uri,
+    alive: bool,
+    probe_latency: Duration,
+    conns: u32,
+    conns_served: u32,
+}
+
+fn render_report(snapshot: &ReportSnapshot) -> String {
+    use std::fmt::Write as _;
+
+    let rows: Vec<_> = snapshot
+        .servers
+        .iter()
+        .map(|server| {
+            (
+                server.addr.to_string(),
+                if server.alive { "Healthy" } else { "Unhealthy" },
+                format!("{:?}", server.probe_latency),
+                server.conns.to_string(),
+                server.conns_served.to_string(),
+            )
+        })
+        .collect();
+
+    let addr_width = rows
+        .iter()
+        .map(|row| row.0.len())
+        .max()
+        .unwrap_or(0)
+        .max("Backend".len());
+    let health_width = "Health".len().max("Unhealthy".len());
+    let latency_width = rows
+        .iter()
+        .map(|row| row.2.len())
+        .max()
+        .unwrap_or(0)
+        .max("Probe latency".len());
+    let active_width = rows
+        .iter()
+        .map(|row| row.3.len())
+        .max()
+        .unwrap_or(0)
+        .max("Active".len());
+    let served_width = rows
+        .iter()
+        .map(|row| row.4.len())
+        .max()
+        .unwrap_or(0)
+        .max("Served".len());
+
+    let mut report = String::new();
+    let _ = writeln!(report, "Health check #{}", snapshot.health_check);
+    let _ = writeln!(
+        report,
+        "{:<addr_width$}  {:<health_width$}  {:>latency_width$}  {:>active_width$}  {:>served_width$}",
+        "Backend", "Health", "Probe latency", "Active", "Served"
+    );
+    let _ = writeln!(
+        report,
+        "{:-<addr_width$}  {:-<health_width$}  {:-<latency_width$}  {:-<active_width$}  {:-<served_width$}",
+        "", "", "", "", ""
+    );
+
+    for row in &rows {
+        let _ = writeln!(
+            report,
+            "{:<addr_width$}  {:<health_width$}  {:>latency_width$}  {:>active_width$}  {:>served_width$}",
+            row.0, row.1, row.2, row.3, row.4
+        );
+    }
+
+    let active_conns: u64 = snapshot
+        .servers
+        .iter()
+        .map(|server| u64::from(server.conns))
+        .sum();
+    let conns_served: u64 = snapshot
+        .servers
+        .iter()
+        .map(|server| u64::from(server.conns_served))
+        .sum();
+    let alive_servers = snapshot
+        .servers
+        .iter()
+        .filter(|server| server.alive)
+        .count();
+    let tot_probe_latency = snapshot
+        .servers
+        .iter()
+        .fold(Duration::ZERO, |total, server| total + server.probe_latency);
+    let avg_probe_latency = if snapshot.servers.is_empty() {
+        None
+    } else {
+        Some(tot_probe_latency / snapshot.servers.len() as u32)
+    };
+    let configured_probe_rate = if snapshot.probe_interval.is_zero() {
+        None
+    } else {
+        Some(snapshot.servers.len() as f64 / snapshot.probe_interval.as_secs_f64())
+    };
+
+    let _ = writeln!(report);
+    match configured_probe_rate {
+        Some(rate) => {
+            let _ = writeln!(
+                report,
+                "Probe schedule: one per backend every {:?}; configured aggregate rate: {rate:.2} probes/s",
+                snapshot.probe_interval
+            );
+        }
+        None => {
+            let _ = writeln!(
+                report,
+                "Probe schedule: interval is zero (invalid configuration)"
+            );
+        }
+    }
+    let _ = writeln!(report, "Summary");
+    let _ = writeln!(
+        report,
+        "Backends healthy: {alive_servers}/{}",
+        snapshot.servers.len()
+    );
+    let _ = writeln!(report, "Active connections: {active_conns}");
+    let _ = writeln!(report, "Connections served: {conns_served}");
+    match avg_probe_latency {
+        Some(latency) => {
+            let _ = writeln!(report, "Average probe latency: {latency:?}");
+        }
+        None => {
+            let _ = writeln!(report, "Average probe latency: n/a");
+        }
+    }
+    let _ = writeln!(report);
+
+    report
+}
+
+fn record_health_probe(server: &mut Server, healthy: bool, latency: Duration) {
+    server.alive = healthy;
+    server.health_check_response_time = latency;
+}
 
 const UPLOAD_ACTIVE: u8 = 0;
 const UPLOAD_COMPLETE: u8 = 1;
@@ -168,6 +318,7 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
     let connector = HttpConnector::new();
     let backend_client: Arc<BackendClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(connector));
+    let health_check_client = reqwest::Client::builder().build()?;
 
     let (health_check_interval, len, health_check_timeout, report, save, save_file) = {
         // gets health check interval and number of servers
@@ -185,57 +336,43 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
 
     tokio::task::spawn(async move {
         let mut health_checks: u32 = 0;
+        let mut health_check_timer = tokio::time::interval(health_check_interval);
+        health_check_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            health_check_timer.tick().await;
+            health_checks = health_checks.saturating_add(1);
             let mut tasks = Vec::new();
 
             for index in 0..len {
                 let lb_clone: Arc<Mutex<LoadBalancer>> = Arc::clone(&lb_clone);
+                let health_check_client = health_check_client.clone();
 
                 let task = tokio::task::spawn(async move {
                     let server = {
-                        // gets a local copy of server
-                        let mut lb = lb_clone.lock().unwrap();
-
-                        if let Some(server) = lb.servers.get_mut(index) {
-                            server.connections_served += 1;
-                            server.connections += 1;
-                        }
-
-                        lb.servers[index].clone()
+                        let lb = lb_clone.lock().unwrap();
+                        lb.servers.get(index).cloned()
+                    };
+                    let Some(server) = server else {
+                        return;
                     };
 
                     let start = Instant::now();
                     let response = timeout(
                         health_check_timeout,
-                        reqwest::get(server.addr.clone().to_string()),
+                        health_check_client
+                            .get(server.addr.clone().to_string())
+                            .send(),
                     )
-                    .await; // sends a request to server
-                    let duration = start.elapsed(); // get's the response time
+                    .await;
+                    let latency = start.elapsed();
+                    let healthy = matches!(
+                        response,
+                        Ok(Ok(response)) if response.status().is_success()
+                    );
 
                     let mut lb = lb_clone.lock().unwrap();
-
-                    lb.servers[index].response_time = duration;
-
-                    if lb.servers[index].connections > 0 {
-                        lb.servers[index].connections -= 1;
-                    }
-
-                    match response {
-                        Ok(response) => {
-                            if response.is_err()
-                                || lb.servers[index].connections
-                                    >= lb.servers[index].max_connections
-                            {
-                                lb.servers[index].connections = 0;
-                                lb.servers[index].alive = false;
-                            } else {
-                                lb.servers[index].alive = true;
-                            }
-                        }
-                        Err(_) => {
-                            lb.servers[index].connections = 0;
-                            lb.servers[index].alive = false;
-                        }
+                    if let Some(server) = lb.servers.get_mut(index) {
+                        record_health_probe(server, healthy, latency);
                     }
                 });
                 tasks.push(task);
@@ -246,85 +383,54 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
             }
 
             if report || save {
-                health_checks += 1;
-                let lb_lock = lb_clone.lock().unwrap();
-                let report_bool = report;
-                let mut report = String::new();
-                report += &format!("Health check #{}\n", health_checks);
-                report += "+-------------------------------------------------------------------------------------------+\n";
-                report += "|                                       Server Report                                       |\n";
-                report += "+------------------------+---------+---------------+-------------+--------------------------+\n";
-                report += "| Address                | Status  | Response Time | Connections | Connections Served       |\n";
-                report += "+------------------------+---------+---------------+-------------+--------------------------+\n";
+                let snapshot = {
+                    let lb = lb_clone.lock().unwrap();
+                    ReportSnapshot {
+                        health_check: health_checks,
+                        probe_interval: health_check_interval,
+                        servers: lb
+                            .servers
+                            .iter()
+                            .map(|server| ServerReportSnapshot {
+                                addr: server.addr.clone(),
+                                alive: server.alive,
+                                probe_latency: server.health_check_response_time,
+                                conns: server.connections,
+                                conns_served: server.connections_served,
+                            })
+                            .collect(),
+                    }
+                };
+                let report_text = render_report(&snapshot);
 
-                let mut total_connections = 0;
-                let mut total_connections_served = 0;
-                let mut total_response_time = Duration::from_secs(0);
-                let mut alive_servers = 0;
-
-                for server in lb_lock.servers.iter() {
-                    let status = if server.alive { "Alive  " } else { "Dead   " };
-                    let bar = if server.alive { "🟢" } else { "🔴" };
-                    let response_time = format!("{:?}", server.response_time);
-                    report += &format!(
-                        "| {:<20} | {:<7} | {:<13} | {:<11} | {:<24} | {}\n",
-                        server.addr,
-                        status,
-                        response_time,
-                        server.connections,
-                        server.connections_served,
-                        bar
-                    );
-
-                    total_connections += server.connections;
-                    total_connections_served += server.connections_served;
-                    if server.alive {
-                        alive_servers += 1;
-                        total_response_time += server.response_time;
+                if report {
+                    let mut stdout = tokio::io::stdout();
+                    if let Err(error) = stdout.write_all(report_text.as_bytes()).await {
+                        tracing::error!(error = %error, "Failed to write load balancer report to stdout");
                     }
                 }
 
-                report += "+------------------------+---------+---------------+-------------+--------------------------+\n";
-
-                let avg_response_time = if alive_servers > 0 {
-                    total_response_time / alive_servers as u32
-                } else {
-                    Duration::from_secs(0)
-                };
-
-                report += "\n+----------------------------------+\n";
-                report += "|           LB Summary             |\n";
-                report += "+----------------------------------+\n";
-                report += &format!("| Total Connections    : {:<10}|\n", total_connections);
-                report += &format!(
-                    "| Connections Served   : {:<10}|\n",
-                    total_connections_served
-                );
-                report += &format!("| Avg Response Time    : {:<10?}|\n", avg_response_time);
-                report += &format!("| Alive Servers        : {:<10}|\n", alive_servers);
-                report += "+----------------------------------+\n";
-
-                if report_bool {
-                    print!("\x1B[2J\x1B[H");
-                    println!("{}", report);
-                }
-
                 if save {
-                    let mut file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(&save_file)
-                        .unwrap();
-
-                    let t = chrono::prelude::Local::now()
+                    let timestamp = chrono::prelude::Local::now()
                         .format("%d/%m/%y %H:%M:%S")
                         .to_string();
-                    drop(writeln!(file, "Log: {:?}", t));
-                    drop(writeln!(file, "{}", report));
+                    let saved_report = format!("Log: {:?}\n{}\n", timestamp, report_text);
+                    let save_result = async {
+                        let mut file = tokio::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&save_file)
+                            .await?;
+                        file.write_all(saved_report.as_bytes()).await?;
+                        file.flush().await
+                    }
+                    .await;
+
+                    if let Err(error) = save_result {
+                        tracing::error!(path = %save_file, error = %error, "Failed to append load balancer report");
+                    }
                 }
             }
-
-            sleep(health_check_interval).await;
         }
     });
 

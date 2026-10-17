@@ -170,6 +170,21 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
         .collect();
 
     let timeout = Duration::from_secs(raw.timeout);
+    let health_check_timeout = raw.health_check_timeout.unwrap_or(raw.timeout);
+    if health_check_timeout == 0 {
+        return Err(invalid_value(
+            "health check timeout",
+            "0",
+            "must be greater than zero",
+        ));
+    }
+    if raw.health_check_interval == 0 {
+        return Err(invalid_value(
+            "health check interval",
+            "0",
+            "must be greater than zero",
+        ));
+    }
     let client_upload_timeout = raw.client_upload_timeout.unwrap_or(60);
     if client_upload_timeout == 0 {
         return Err(invalid_value(
@@ -184,7 +199,7 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
         servers,
         timeout,
         client_upload_timeout: Duration::from_secs(client_upload_timeout),
-        health_check_timeout: Duration::from_secs(raw.health_check_timeout.unwrap_or(raw.timeout)),
+        health_check_timeout: Duration::from_secs(health_check_timeout),
         health_check_interval: Duration::from_secs(raw.health_check_interval),
     })
 }
