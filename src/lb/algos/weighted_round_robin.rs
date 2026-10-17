@@ -33,6 +33,7 @@ impl Loadbalancer for WeightedRoundRobin {
         let mut eligible_count = 0;
         let mut max_weight = 0usize;
         let mut gcd_weight = 0usize;
+
         for (index, server) in servers.iter().enumerate() {
             if !is_eligible(index, server) || server.weight == 0 {
                 continue;
@@ -42,6 +43,7 @@ impl Loadbalancer for WeightedRoundRobin {
             max_weight = max_weight.max(weight);
             gcd_weight = Self::gcd(gcd_weight, weight);
         }
+
         if eligible_count == 0 {
             return None;
         }

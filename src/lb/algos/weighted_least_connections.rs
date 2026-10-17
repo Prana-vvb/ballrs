@@ -19,7 +19,22 @@ impl Loadbalancer for WeightedLeastConnections {
             .iter()
             .enumerate()
             .filter(|(index, server)| is_eligible(*index, server) && server.weight > 0)
-            .min_by_key(|(_, server)| server.connections / server.weight)
+            .fold(None, |best, candidate| match best {
+                None => Some(candidate),
+                Some((best_index, best_server)) => {
+                    // Compare connections / weight without truncating either ratio.
+                    let candidate_score =
+                        u64::from(candidate.1.connections) * u64::from(best_server.weight);
+                    let best_score =
+                        u64::from(best_server.connections) * u64::from(candidate.1.weight);
+
+                    if candidate_score < best_score {
+                        Some(candidate)
+                    } else {
+                        Some((best_index, best_server))
+                    }
+                }
+            })
             .map(|(index, _)| index)
     }
 }
