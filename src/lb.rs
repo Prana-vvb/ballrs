@@ -650,7 +650,7 @@ fn failure_response(failure: ProxyFailure) -> Response<ProxyBody> {
 struct ConnectionGuard {
     lb: Arc<Mutex<LoadBalancer>>,
     index: usize,
-    started_at: Option<Instant>,
+    response_latency: Option<Duration>,
 }
 
 impl ConnectionGuard {
@@ -662,6 +662,14 @@ impl ConnectionGuard {
             }
         }
     }
+
+    fn record_completed_latency(&self) {
+        if let (Some(latency), Ok(mut lb)) = (self.response_latency, self.lb.lock()) {
+            if let Some(server) = lb.servers.get_mut(self.index) {
+                server.record_request_latency(latency);
+            }
+        }
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -669,9 +677,6 @@ impl Drop for ConnectionGuard {
         if let Ok(mut lb) = self.lb.lock() {
             if let Some(server) = lb.servers.get_mut(self.index) {
                 server.connections = server.connections.saturating_sub(1);
-                if let Some(started_at) = self.started_at {
-                    server.response_time = started_at.elapsed();
-                }
             }
         }
     }
@@ -714,6 +719,8 @@ impl StreamingBody {
             if let Some(connection) = &self.connection {
                 connection.mark_failed();
             }
+        } else if let Some(connection) = &self.connection {
+            connection.record_completed_latency();
         }
         self.connection.take();
     }
@@ -849,7 +856,7 @@ where
     let mut connection = ConnectionGuard {
         lb: Arc::clone(&lb),
         index,
-        started_at: None,
+        response_latency: None,
     };
     match send_request(
         backend_client.as_ref(),
@@ -863,8 +870,8 @@ where
     )
     .await
     {
-        Ok((response, backend_started_at)) => {
-            connection.started_at = Some(backend_started_at);
+        Ok((response, backend_started_at, response_latency)) => {
+            connection.response_latency = response_latency;
             let deadline = TokioInstant::from_std(backend_started_at + timeout_duration);
             let (parts, body) = response.into_parts();
             let body =
@@ -931,7 +938,7 @@ async fn send_request(
     body: RequestBody,
     response_timeout: Duration,
     upload_idle_timeout: Duration,
-) -> Result<(Response<Incoming>, Instant), SendFailure> {
+) -> Result<(Response<Incoming>, Instant, Option<Duration>), SendFailure> {
     let upload_state = Arc::new(AtomicU8::new(UPLOAD_ACTIVE));
     let (upload_started_tx, mut upload_started_rx) = oneshot::channel();
     let (upload_completed_tx, mut upload_completed_rx) = oneshot::channel();
@@ -968,6 +975,7 @@ async fn send_request(
         .map_err(|_| SendFailure::Backend)?;
     *request.headers_mut() = forwarded_headers;
 
+    let request_started_at = Instant::now();
     let mut request_future = Box::pin(client.request(request));
     let mut upload_completed_at = None;
     let mut connect_deadline = Box::pin(tokio::time::sleep(response_timeout));
@@ -1009,10 +1017,14 @@ async fn send_request(
         _ = connect_deadline.as_mut() => return Err(SendFailure::BackendTimeout),
     };
     let mut response = response;
-    let backend_started_at = upload_completed_at
-        .or_else(|| upload_completed_rx.try_recv().ok().flatten())
-        .unwrap_or_else(Instant::now);
+    let upload_finished_at =
+        upload_completed_at.or_else(|| upload_completed_rx.try_recv().ok().flatten());
+    let backend_started_at = upload_finished_at.unwrap_or(request_started_at);
+    let response_headers_at = Instant::now();
+    let response_latency =
+        upload_finished_at.map(|started_at| response_headers_at.duration_since(started_at));
     response.headers_mut().remove(hyper::header::CONNECTION);
+
     response
         .headers_mut()
         .remove(hyper::header::HeaderName::from_static("keep-alive"));
@@ -1029,7 +1041,7 @@ async fn send_request(
         .remove(hyper::header::TRANSFER_ENCODING);
     response.headers_mut().remove(hyper::header::UPGRADE);
 
-    Ok((response, backend_started_at))
+    Ok((response, backend_started_at, response_latency))
 }
 
 fn classify_client_result(

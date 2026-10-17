@@ -36,8 +36,9 @@ enum BackendHealthUpdate {
 struct Server {
     addr: hyper::Uri,
     weight: u32,
-    response_time: Duration,
+    request_latency_ewma: Option<Duration>,
     health_check_response_time: Duration,
+    health_check_sampled: bool,
     connections: u32,
     max_connections: u32,
     request_timeout: Option<Duration>,
@@ -55,6 +56,7 @@ impl Server {
                 latency,
             } => {
                 self.health_check_response_time = latency;
+                self.health_check_sampled = healthy;
                 (started_at, healthy)
             }
             BackendHealthUpdate::RequestFailure { observed_at } => (observed_at, false),
@@ -64,6 +66,26 @@ impl Server {
             self.alive = healthy;
             self.availability_updated_at = observed_at;
         }
+    }
+
+    fn response_time_estimate(&self) -> Option<Duration> {
+        self.request_latency_ewma.or_else(|| {
+            self.health_check_sampled
+                .then_some(self.health_check_response_time)
+        })
+    }
+
+    fn record_request_latency(&mut self, sample: Duration) {
+        const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+        let next_nanos = match self.request_latency_ewma {
+            Some(previous) => (previous.as_nanos() * 4 + sample.as_nanos()) / 5,
+            None => sample.as_nanos(),
+        };
+        self.request_latency_ewma = Some(Duration::new(
+            (next_nanos / NANOS_PER_SECOND) as u64,
+            (next_nanos % NANOS_PER_SECOND) as u32,
+        ));
     }
 
     fn new(
@@ -76,8 +98,9 @@ impl Server {
             addr,
             weight,
             max_connections,
-            response_time: Duration::from_secs(0),
+            request_latency_ewma: None,
             health_check_response_time: Duration::from_secs(0),
+            health_check_sampled: false,
             connections: 0,
             alive: true,
             availability_updated_at: Instant::now(),
