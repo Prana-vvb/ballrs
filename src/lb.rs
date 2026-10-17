@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Instant as TokioInstant, Sleep};
 
-use crate::{Algorithm, LoadBalancer, Server};
+use crate::{Algorithm, BackendHealthUpdate, LoadBalancer, Server};
 mod algos;
 use algos::least_connections::LeastConnections;
 use algos::least_response_time::LeastResponseTime;
@@ -184,9 +184,12 @@ fn render_report(snapshot: &ReportSnapshot) -> String {
     report
 }
 
-fn record_health_probe(server: &mut Server, healthy: bool, latency: Duration) {
-    server.alive = healthy;
-    server.health_check_response_time = latency;
+fn record_health_probe(server: &mut Server, started_at: Instant, healthy: bool, latency: Duration) {
+    server.record_health_update(BackendHealthUpdate::Probe {
+        started_at,
+        healthy,
+        latency,
+    });
 }
 
 const UPLOAD_ACTIVE: u8 = 0;
@@ -356,7 +359,7 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
                         return;
                     };
 
-                    let start = Instant::now();
+                    let probe_started_at = Instant::now();
                     let response = timeout(
                         health_check_timeout,
                         health_check_client
@@ -364,7 +367,7 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
                             .send(),
                     )
                     .await;
-                    let latency = start.elapsed();
+                    let latency = probe_started_at.elapsed();
                     let healthy = matches!(
                         response,
                         Ok(Ok(response)) if response.status().is_success()
@@ -372,7 +375,7 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
 
                     let mut lb = lb_clone.lock().unwrap();
                     if let Some(server) = lb.servers.get_mut(index) {
-                        record_health_probe(server, healthy, latency);
+                        record_health_probe(server, probe_started_at, healthy, latency);
                     }
                 });
                 tasks.push(task);
@@ -652,9 +655,10 @@ struct ConnectionGuard {
 
 impl ConnectionGuard {
     fn mark_failed(&self) {
+        let observed_at = Instant::now();
         if let Ok(mut lb) = self.lb.lock() {
             if let Some(server) = lb.servers.get_mut(self.index) {
-                server.alive = false;
+                server.record_health_update(BackendHealthUpdate::RequestFailure { observed_at });
             }
         }
     }

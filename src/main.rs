@@ -1,7 +1,7 @@
 use clap::{command, Arg, ArgAction, Command};
 use std::error::Error;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod config;
 mod lb;
@@ -20,6 +20,18 @@ struct LoadBalancer {
     save: bool,
 }
 
+#[derive(Clone, Copy)]
+enum BackendHealthUpdate {
+    Probe {
+        started_at: Instant,
+        healthy: bool,
+        latency: Duration,
+    },
+    RequestFailure {
+        observed_at: Instant,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Server {
     addr: hyper::Uri,
@@ -30,10 +42,30 @@ struct Server {
     max_connections: u32,
     request_timeout: Option<Duration>,
     alive: bool,
+    availability_updated_at: Instant,
     connections_served: u32,
 }
 
 impl Server {
+    fn record_health_update(&mut self, update: BackendHealthUpdate) {
+        let (observed_at, healthy) = match update {
+            BackendHealthUpdate::Probe {
+                started_at,
+                healthy,
+                latency,
+            } => {
+                self.health_check_response_time = latency;
+                (started_at, healthy)
+            }
+            BackendHealthUpdate::RequestFailure { observed_at } => (observed_at, false),
+        };
+
+        if observed_at >= self.availability_updated_at {
+            self.alive = healthy;
+            self.availability_updated_at = observed_at;
+        }
+    }
+
     fn new(
         addr: hyper::Uri,
         weight: u32,
@@ -48,6 +80,7 @@ impl Server {
             health_check_response_time: Duration::from_secs(0),
             connections: 0,
             alive: true,
+            availability_updated_at: Instant::now(),
             connections_served: 0,
             request_timeout,
         }
