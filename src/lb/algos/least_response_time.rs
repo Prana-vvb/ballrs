@@ -10,13 +10,16 @@ impl LeastResponseTime {
 }
 
 impl Loadbalancer for LeastResponseTime {
-    fn get_index(&mut self, servers: &[&Server]) -> Option<usize> {
-        let min_index = servers
+    fn get_index(
+        &mut self,
+        servers: &[Server],
+        is_eligible: &dyn Fn(usize, &Server) -> bool,
+    ) -> Option<usize> {
+        servers
             .iter()
             .enumerate()
+            .filter(|(index, server)| is_eligible(*index, server))
             .min_by_key(|(_, server)| server.response_time.as_millis() as u32)
-            .map(|(index, _)| index);
-
-        min_index
+            .map(|(index, _)| index)
     }
 }

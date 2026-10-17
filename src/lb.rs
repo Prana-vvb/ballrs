@@ -702,27 +702,24 @@ where
     let (timeout_duration, client_upload_timeout, index, uri) = {
         let mut lb = lb.lock().unwrap();
 
-        let eligible: Vec<(usize, &Server)> = lb
-            .servers
-            .iter()
-            .enumerate()
-            .filter(|(index, server)| {
-                server.alive
-                    && server.connections < server.max_connections
-                    && !attempted.contains(index)
-            })
-            .collect();
-        if eligible.is_empty() {
-            return Err(ProxyFailure::NoBackend);
-        }
-        let eligible_refs: Vec<&Server> = eligible.iter().map(|(_, server)| *server).collect();
-        let Some(selected) = load_balancer.lock().unwrap().get_index(&eligible_refs) else {
+        let is_eligible = |index: usize, server: &Server| {
+            server.alive
+                && server.connections < server.max_connections
+                && !attempted.contains(&index)
+        };
+
+        let Some(index) = load_balancer
+            .lock()
+            .unwrap()
+            .get_index(&lb.servers, &is_eligible)
+        else {
             return Err(ProxyFailure::NoBackend);
         };
-        let Some((index, server)) = eligible.get(selected) else {
+
+        let Some(server) = lb.servers.get(index) else {
             return Err(ProxyFailure::NoBackend);
         };
-        let index = *index;
+
         request_span.record("backend_index", index + 1);
         let backend = server.addr.clone();
         attempted.insert(index);
@@ -730,6 +727,7 @@ where
 
         lb.servers[index].connections += 1;
         lb.servers[index].connections_served += 1;
+
         (
             lb.servers[index].request_timeout.unwrap_or(lb.timeout),
             lb.client_upload_timeout,
@@ -944,5 +942,9 @@ fn classify_upload_state(upload_state: u8) -> SendFailure {
 }
 
 pub trait Loadbalancer: Send {
-    fn get_index(&mut self, lb: &[&Server]) -> Option<usize>;
+    fn get_index(
+        &mut self,
+        servers: &[Server],
+        is_eligible: &dyn Fn(usize, &Server) -> bool,
+    ) -> Option<usize>;
 }

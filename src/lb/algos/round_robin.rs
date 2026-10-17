@@ -16,13 +16,26 @@ impl RoundRobin {
 }
 
 impl Loadbalancer for RoundRobin {
-    fn get_index(&mut self, servers: &[&Server]) -> Option<usize> {
-        if servers.is_empty() {
+    fn get_index(
+        &mut self,
+        servers: &[Server],
+        is_eligible: &dyn Fn(usize, &Server) -> bool,
+    ) -> Option<usize> {
+        let eligible_count = servers
+            .iter()
+            .enumerate()
+            .filter(|(index, server)| is_eligible(*index, server))
+            .count();
+        if eligible_count == 0 {
             return None;
         }
 
-        let index = self.counter.fetch_add(1, Ordering::SeqCst) % servers.len();
-
-        Some(index)
+        let selected = self.counter.fetch_add(1, Ordering::Relaxed) % eligible_count;
+        servers
+            .iter()
+            .enumerate()
+            .filter(|(index, server)| is_eligible(*index, server))
+            .nth(selected)
+            .map(|(index, _)| index)
     }
 }
