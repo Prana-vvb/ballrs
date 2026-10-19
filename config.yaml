@@ -29,5 +29,15 @@ server timeouts: default, default, default
 # max time allowed for a health check (in s)
 health check timeout: 10
 
+# health-check paths and timeout overrides in server-list order
+# paths are joined to each backend's configured base path
+# use 'default' to inherit the global health check timeout
+health check paths: /, /, /
+health check timeouts: default, default, default
+
 #  interval (in s) for checking the health of the server
 health check interval: 10
+
+# consecutive probe results required to change backend health
+health check healthy threshold: 1
+health check unhealthy threshold: 2

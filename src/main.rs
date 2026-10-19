@@ -16,6 +16,8 @@ struct LoadBalancer {
     client_upload_timeout: Duration,
     health_check_timeout: Duration,
     health_check_interval: Duration,
+    health_check_healthy_threshold: u32,
+    health_check_unhealthy_threshold: u32,
     report: bool,
     save_file: String,
     save: bool,
@@ -26,7 +28,6 @@ struct RuntimeConfig {
     load_balancer: hyper::Uri,
     timeout: Duration,
     client_upload_timeout: Duration,
-    health_check_timeout: Duration,
     health_check_interval: Duration,
     report: bool,
     save_file: String,
@@ -51,6 +52,10 @@ struct Server {
     weight: u32,
     max_connections: u32,
     request_timeout: Option<Duration>,
+    health_check_path: hyper::Uri,
+    health_check_timeout: Duration,
+    health_check_healthy_threshold: u32,
+    health_check_unhealthy_threshold: u32,
     metrics: Mutex<BackendMetrics>,
 }
 
@@ -59,6 +64,8 @@ struct BackendMetrics {
     request_latency_ewma: Option<Duration>,
     health_check_response_time: Duration,
     health_check_sampled: bool,
+    consecutive_probe_successes: u32,
+    consecutive_probe_failures: u32,
     connections: u32,
     alive: bool,
     availability_updated_at: Instant,
@@ -129,23 +136,47 @@ impl Server {
 
     fn record_health_update(&self, update: BackendHealthUpdate) {
         let mut metrics = lock_recover(&self.metrics, "backend_metrics");
-        let (observed_at, healthy) = match update {
+        match update {
             BackendHealthUpdate::Probe {
                 started_at,
                 healthy,
                 latency,
             } => {
-                metrics.health_check_response_time = latency;
-                metrics.health_check_sampled = healthy;
-                (started_at, healthy)
+                if started_at >= metrics.availability_updated_at {
+                    metrics.health_check_response_time = latency;
+                    metrics.health_check_sampled = healthy;
+                    if healthy {
+                        metrics.consecutive_probe_failures = 0;
+                        metrics.consecutive_probe_successes =
+                            metrics.consecutive_probe_successes.saturating_add(1);
+                        if metrics.consecutive_probe_successes
+                            >= self.health_check_healthy_threshold
+                        {
+                            metrics.alive = true;
+                        }
+                    } else {
+                        metrics.consecutive_probe_successes = 0;
+                        metrics.consecutive_probe_failures =
+                            metrics.consecutive_probe_failures.saturating_add(1);
+                        if metrics.consecutive_probe_failures
+                            >= self.health_check_unhealthy_threshold
+                        {
+                            metrics.alive = false;
+                        }
+                    }
+                    metrics.availability_updated_at = started_at;
+                }
+                return;
             }
-            BackendHealthUpdate::RequestFailure { observed_at } => (observed_at, false),
+            BackendHealthUpdate::RequestFailure { observed_at } => {
+                if observed_at >= metrics.availability_updated_at {
+                    metrics.consecutive_probe_successes = 0;
+                    metrics.alive = false;
+                    metrics.availability_updated_at = observed_at;
+                }
+                return;
+            }
         };
-
-        if observed_at >= metrics.availability_updated_at {
-            metrics.alive = healthy;
-            metrics.availability_updated_at = observed_at;
-        }
     }
 
     fn record_request_latency(&self, sample: Duration) {
@@ -167,16 +198,26 @@ impl Server {
         weight: u32,
         max_connections: u32,
         request_timeout: Option<Duration>,
+        health_check_path: hyper::Uri,
+        health_check_timeout: Duration,
+        health_check_healthy_threshold: u32,
+        health_check_unhealthy_threshold: u32,
     ) -> Self {
         Server {
             addr,
             weight,
             max_connections,
             request_timeout,
+            health_check_path,
+            health_check_timeout,
+            health_check_healthy_threshold,
+            health_check_unhealthy_threshold,
             metrics: Mutex::new(BackendMetrics {
                 request_latency_ewma: None,
                 health_check_response_time: Duration::ZERO,
                 health_check_sampled: false,
+                consecutive_probe_successes: 0,
+                consecutive_probe_failures: 0,
                 connections: 0,
                 alive: true,
                 availability_updated_at: Instant::now(),
@@ -196,6 +237,8 @@ impl LoadBalancer {
             client_upload_timeout: Duration::from_secs(60),
             health_check_timeout: Duration::from_secs(0),
             health_check_interval: Duration::from_secs(0),
+            health_check_healthy_threshold: 1,
+            health_check_unhealthy_threshold: 2,
             report: true,
             save_file: String::from("data.txt"),
             save: false,
@@ -215,6 +258,10 @@ impl LoadBalancer {
                     server.weight,
                     server.max_connections,
                     server.request_timeout,
+                    server.health_check_path,
+                    server.health_check_timeout,
+                    config.health_check_healthy_threshold,
+                    config.health_check_unhealthy_threshold,
                 )
             })
             .collect();
@@ -222,6 +269,8 @@ impl LoadBalancer {
         self.client_upload_timeout = config.client_upload_timeout;
         self.health_check_timeout = config.health_check_timeout;
         self.health_check_interval = config.health_check_interval;
+        self.health_check_healthy_threshold = config.health_check_healthy_threshold;
+        self.health_check_unhealthy_threshold = config.health_check_unhealthy_threshold;
 
         Ok(self)
     }
@@ -421,8 +470,20 @@ fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let health_check_paths = lb
+        .servers
+        .iter()
+        .map(|server| server.health_check_path.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let health_check_timeouts = lb
+        .servers
+        .iter()
+        .map(|server| server.health_check_timeout.as_secs().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let config = format!(
-        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nclient upload timeout: {}\nserver timeouts: {}\nhealth check timeout: {}\nhealth check interval: {}\n",
+        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nclient upload timeout: {}\nserver timeouts: {}\nhealth check timeout: {}\nhealth check paths: {}\nhealth check timeouts: {}\nhealth check interval: {}\nhealth check healthy threshold: {}\nhealth check unhealthy threshold: {}\n",
         lb.load_balancer,
         algorithm,
         servers,
@@ -432,7 +493,11 @@ fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
         lb.client_upload_timeout.as_secs(),
         server_timeouts,
         lb.health_check_timeout.as_secs(),
+        health_check_paths,
+        health_check_timeouts,
         lb.health_check_interval.as_secs(),
+        lb.health_check_healthy_threshold,
+        lb.health_check_unhealthy_threshold,
     );
 
     std::fs::write(path, config)

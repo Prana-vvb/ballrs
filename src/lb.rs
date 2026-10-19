@@ -321,7 +321,6 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
         load_balancer: lb.load_balancer,
         timeout: lb.timeout,
         client_upload_timeout: lb.client_upload_timeout,
-        health_check_timeout: lb.health_check_timeout,
         health_check_interval: lb.health_check_interval,
         report: lb.report,
         save_file: lb.save_file,
@@ -339,7 +338,6 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
     let health_check_client = reqwest::Client::builder().build()?;
 
     let health_check_interval = config.health_check_interval;
-    let health_check_timeout = config.health_check_timeout;
     let report = config.report;
     let save = config.save;
     let save_file = config.save_file.clone();
@@ -359,18 +357,21 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
 
                 let task = tokio::task::spawn(async move {
                     let probe_started_at = Instant::now();
-                    let response = timeout(
-                        health_check_timeout,
-                        health_check_client
-                            .get(server.addr.clone().to_string())
-                            .send(),
-                    )
-                    .await;
+                    let healthy = match backend_uri(&server.addr, &server.health_check_path) {
+                        Ok(uri) => matches!(
+                            timeout(
+                                server.health_check_timeout,
+                                health_check_client.get(uri.to_string()).send(),
+                            )
+                            .await,
+                            Ok(Ok(response)) if response.status().is_success()
+                        ),
+                        Err(error) => {
+                            tracing::warn!(backend = %server.addr, %error, "Invalid health-check URI");
+                            false
+                        }
+                    };
                     let latency = probe_started_at.elapsed();
-                    let healthy = matches!(
-                        response,
-                        Ok(Ok(response)) if response.status().is_success()
-                    );
 
                     record_health_probe(&server, probe_started_at, healthy, latency);
                 });

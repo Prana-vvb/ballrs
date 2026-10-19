@@ -12,6 +12,8 @@ pub(crate) struct ServerConfig {
     pub(crate) weight: u32,
     pub(crate) max_connections: u32,
     pub(crate) request_timeout: Option<Duration>,
+    pub(crate) health_check_path: Uri,
+    pub(crate) health_check_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -23,6 +25,8 @@ pub(crate) struct Config {
     pub(crate) client_upload_timeout: Duration,
     pub(crate) health_check_timeout: Duration,
     pub(crate) health_check_interval: Duration,
+    pub(crate) health_check_healthy_threshold: u32,
+    pub(crate) health_check_unhealthy_threshold: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,8 +88,16 @@ struct RawConfig {
     server_timeouts: Option<RawList<RawServerTimeout>>,
     #[serde(rename = "health check timeout")]
     health_check_timeout: Option<u64>,
+    #[serde(rename = "health check paths")]
+    health_check_paths: Option<RawList<String>>,
+    #[serde(rename = "health check timeouts")]
+    health_check_timeouts: Option<RawList<RawServerTimeout>>,
     #[serde(rename = "health check interval")]
     health_check_interval: u64,
+    #[serde(rename = "health check healthy threshold")]
+    health_check_healthy_threshold: u32,
+    #[serde(rename = "health check unhealthy threshold")]
+    health_check_unhealthy_threshold: u32,
 }
 
 impl Default for RawConfig {
@@ -100,7 +112,11 @@ impl Default for RawConfig {
             client_upload_timeout: None,
             server_timeouts: None,
             health_check_timeout: None,
-            health_check_interval: 0,
+            health_check_paths: None,
+            health_check_timeouts: None,
+            health_check_interval: 10,
+            health_check_healthy_threshold: 1,
+            health_check_unhealthy_threshold: 2,
         }
     }
 }
@@ -154,22 +170,30 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
     };
     validate_list_len("server timeouts", server_timeouts.len(), server_addrs.len())?;
 
-    let servers = server_addrs
-        .into_iter()
-        .zip(weights)
-        .zip(max_connections)
-        .zip(server_timeouts)
-        .map(
-            |(((addr, weight), max_connections), request_timeout)| ServerConfig {
-                addr,
-                weight,
-                max_connections,
-                request_timeout,
-            },
-        )
-        .collect();
+    let health_check_paths = match raw.health_check_paths {
+        Some(paths) => paths
+            .into_values(|value| Ok(value.to_owned()))?
+            .into_iter()
+            .map(|value| {
+                let path: Uri = parse_value("health check paths", &value)?;
+                if !path.path().starts_with('/') || path.authority().is_some() {
+                    return Err(invalid_value(
+                        "health check paths",
+                        &value,
+                        "expected a path beginning with '/'",
+                    ));
+                }
+                Ok(path)
+            })
+            .collect::<io::Result<Vec<Uri>>>()?,
+        None => vec![Uri::from_static("/"); server_addrs.len()],
+    };
+    validate_list_len(
+        "health check paths",
+        health_check_paths.len(),
+        server_addrs.len(),
+    )?;
 
-    let timeout = Duration::from_secs(raw.timeout);
     let health_check_timeout = raw.health_check_timeout.unwrap_or(raw.timeout);
     if health_check_timeout == 0 {
         return Err(invalid_value(
@@ -178,9 +202,74 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
             "must be greater than zero",
         ));
     }
+    let health_check_timeouts = match raw.health_check_timeouts {
+        Some(timeouts) => timeouts
+            .into_values(parse_server_timeout)?
+            .into_iter()
+            .map(RawServerTimeout::into_duration)
+            .map(|timeout| {
+                timeout.map(|value| value.unwrap_or(Duration::from_secs(health_check_timeout)))
+            })
+            .collect::<io::Result<Vec<_>>>()?,
+        None => vec![Duration::from_secs(health_check_timeout); server_addrs.len()],
+    };
+    validate_list_len(
+        "health check timeouts",
+        health_check_timeouts.len(),
+        server_addrs.len(),
+    )?;
+    if let Some((index, _)) = health_check_timeouts
+        .iter()
+        .enumerate()
+        .find(|(_, timeout)| timeout.is_zero())
+    {
+        return Err(invalid_value(
+            "health check timeouts",
+            &format!("entry {} = 0", index + 1),
+            "must be greater than zero",
+        ));
+    }
+
+    let servers = server_addrs
+        .into_iter()
+        .zip(weights)
+        .zip(max_connections)
+        .zip(server_timeouts)
+        .zip(health_check_paths)
+        .zip(health_check_timeouts)
+        .map(
+            |(
+                ((((addr, weight), max_connections), request_timeout), health_check_path),
+                health_check_timeout,
+            )| ServerConfig {
+                addr,
+                weight,
+                max_connections,
+                request_timeout,
+                health_check_path,
+                health_check_timeout,
+            },
+        )
+        .collect();
+
+    let timeout = Duration::from_secs(raw.timeout);
     if raw.health_check_interval == 0 {
         return Err(invalid_value(
             "health check interval",
+            "0",
+            "must be greater than zero",
+        ));
+    }
+    if raw.health_check_healthy_threshold == 0 {
+        return Err(invalid_value(
+            "health check healthy threshold",
+            "0",
+            "must be greater than zero",
+        ));
+    }
+    if raw.health_check_unhealthy_threshold == 0 {
+        return Err(invalid_value(
+            "health check unhealthy threshold",
             "0",
             "must be greater than zero",
         ));
@@ -193,6 +282,7 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
             "must be greater than zero",
         ));
     }
+
     Ok(Config {
         load_balancer,
         algorithm: raw.algorithm,
@@ -201,6 +291,8 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
         client_upload_timeout: Duration::from_secs(client_upload_timeout),
         health_check_timeout: Duration::from_secs(health_check_timeout),
         health_check_interval: Duration::from_secs(raw.health_check_interval),
+        health_check_healthy_threshold: raw.health_check_healthy_threshold,
+        health_check_unhealthy_threshold: raw.health_check_unhealthy_threshold,
     })
 }
 
