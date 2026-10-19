@@ -1,6 +1,7 @@
 use clap::{command, Arg, ArgAction, Command};
 use std::error::Error;
 use std::io;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 mod config;
@@ -11,6 +12,18 @@ struct LoadBalancer {
     load_balancer: hyper::Uri,
     algo: Algorithm,
     servers: Vec<Server>,
+    timeout: Duration,
+    client_upload_timeout: Duration,
+    health_check_timeout: Duration,
+    health_check_interval: Duration,
+    report: bool,
+    save_file: String,
+    save: bool,
+}
+
+#[derive(Clone)]
+struct RuntimeConfig {
+    load_balancer: hyper::Uri,
     timeout: Duration,
     client_upload_timeout: Duration,
     health_check_timeout: Duration,
@@ -32,57 +45,118 @@ enum BackendHealthUpdate {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 struct Server {
     addr: hyper::Uri,
     weight: u32,
+    max_connections: u32,
+    request_timeout: Option<Duration>,
+    metrics: Mutex<BackendMetrics>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackendMetrics {
     request_latency_ewma: Option<Duration>,
     health_check_response_time: Duration,
     health_check_sampled: bool,
     connections: u32,
-    max_connections: u32,
-    request_timeout: Option<Duration>,
     alive: bool,
     availability_updated_at: Instant,
     connections_served: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ServerSnapshot {
+    weight: u32,
+    max_connections: u32,
+    request_latency_ewma: Option<Duration>,
+    health_check_response_time: Duration,
+    health_check_sampled: bool,
+    connections: u32,
+    connections_served: u32,
+    alive: bool,
+}
+
+impl ServerSnapshot {
+    fn response_time_estimate(self) -> Option<Duration> {
+        self.request_latency_ewma.or_else(|| {
+            self.health_check_sampled
+                .then_some(self.health_check_response_time)
+        })
+    }
+}
+
+fn lock_recover<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(lock = lock_name, "Recovering poisoned runtime metrics lock");
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl Server {
-    fn record_health_update(&mut self, update: BackendHealthUpdate) {
+    fn snapshot(&self) -> ServerSnapshot {
+        let metrics = lock_recover(&self.metrics, "backend_metrics");
+        ServerSnapshot {
+            weight: self.weight,
+            max_connections: self.max_connections,
+            request_latency_ewma: metrics.request_latency_ewma,
+            health_check_response_time: metrics.health_check_response_time,
+            health_check_sampled: metrics.health_check_sampled,
+            connections: metrics.connections,
+            connections_served: metrics.connections_served,
+            alive: metrics.alive,
+        }
+    }
+
+    fn try_reserve(&self) -> bool {
+        let mut metrics = lock_recover(&self.metrics, "backend_metrics");
+        if !metrics.alive || metrics.connections >= self.max_connections {
+            return false;
+        }
+        metrics.connections += 1;
+        metrics.connections_served = metrics.connections_served.saturating_add(1);
+        true
+    }
+
+    fn release_connection(&self) {
+        let mut metrics = lock_recover(&self.metrics, "backend_metrics");
+        metrics.connections = metrics.connections.saturating_sub(1);
+    }
+
+    fn record_health_update(&self, update: BackendHealthUpdate) {
+        let mut metrics = lock_recover(&self.metrics, "backend_metrics");
         let (observed_at, healthy) = match update {
             BackendHealthUpdate::Probe {
                 started_at,
                 healthy,
                 latency,
             } => {
-                self.health_check_response_time = latency;
-                self.health_check_sampled = healthy;
+                metrics.health_check_response_time = latency;
+                metrics.health_check_sampled = healthy;
                 (started_at, healthy)
             }
             BackendHealthUpdate::RequestFailure { observed_at } => (observed_at, false),
         };
 
-        if observed_at >= self.availability_updated_at {
-            self.alive = healthy;
-            self.availability_updated_at = observed_at;
+        if observed_at >= metrics.availability_updated_at {
+            metrics.alive = healthy;
+            metrics.availability_updated_at = observed_at;
         }
     }
 
-    fn response_time_estimate(&self) -> Option<Duration> {
-        self.request_latency_ewma.or_else(|| {
-            self.health_check_sampled
-                .then_some(self.health_check_response_time)
-        })
-    }
-
-    fn record_request_latency(&mut self, sample: Duration) {
+    fn record_request_latency(&self, sample: Duration) {
         const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
-        let next_nanos = match self.request_latency_ewma {
+        let mut metrics = lock_recover(&self.metrics, "backend_metrics");
+        let next_nanos = match metrics.request_latency_ewma {
             Some(previous) => (previous.as_nanos() * 4 + sample.as_nanos()) / 5,
             None => sample.as_nanos(),
         };
-        self.request_latency_ewma = Some(Duration::new(
+        metrics.request_latency_ewma = Some(Duration::new(
             (next_nanos / NANOS_PER_SECOND) as u64,
             (next_nanos % NANOS_PER_SECOND) as u32,
         ));
@@ -98,14 +172,16 @@ impl Server {
             addr,
             weight,
             max_connections,
-            request_latency_ewma: None,
-            health_check_response_time: Duration::from_secs(0),
-            health_check_sampled: false,
-            connections: 0,
-            alive: true,
-            availability_updated_at: Instant::now(),
-            connections_served: 0,
             request_timeout,
+            metrics: Mutex::new(BackendMetrics {
+                request_latency_ewma: None,
+                health_check_response_time: Duration::ZERO,
+                health_check_sampled: false,
+                connections: 0,
+                alive: true,
+                availability_updated_at: Instant::now(),
+                connections_served: 0,
+            }),
         }
     }
 }

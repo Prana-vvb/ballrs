@@ -1,6 +1,7 @@
 use crate::lb::Loadbalancer;
 use crate::Server;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub struct WeightedRoundRobin {
     counter: AtomicUsize,
@@ -26,19 +27,20 @@ impl WeightedRoundRobin {
 
 impl Loadbalancer for WeightedRoundRobin {
     fn get_index(
-        &mut self,
-        servers: &[Server],
-        is_eligible: &dyn Fn(usize, &Server) -> bool,
+        &self,
+        servers: &[Arc<Server>],
+        is_eligible: &dyn Fn(usize, &crate::ServerSnapshot) -> bool,
     ) -> Option<usize> {
         let mut eligible_count = 0;
         let mut max_weight = 0usize;
         let mut gcd_weight = 0usize;
 
         for (index, server) in servers.iter().enumerate() {
-            if !is_eligible(index, server) || server.weight == 0 {
+            let snapshot = server.snapshot();
+            if !is_eligible(index, &snapshot) || snapshot.weight == 0 {
                 continue;
             }
-            let weight = server.weight as usize;
+            let weight = snapshot.weight as usize;
             eligible_count += 1;
             max_weight = max_weight.max(weight);
             gcd_weight = Self::gcd(gcd_weight, weight);
@@ -63,10 +65,11 @@ impl Loadbalancer for WeightedRoundRobin {
             let current_weight = self.current_weight.load(Ordering::Relaxed);
             let mut position = 0;
             for (index, server) in servers.iter().enumerate() {
-                if !is_eligible(index, server) || server.weight == 0 {
+                let snapshot = server.snapshot();
+                if !is_eligible(index, &snapshot) || snapshot.weight == 0 {
                     continue;
                 }
-                if position == selected_position && server.weight as usize >= current_weight {
+                if position == selected_position && snapshot.weight as usize >= current_weight {
                     return Some(index);
                 }
                 position += 1;

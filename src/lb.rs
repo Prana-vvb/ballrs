@@ -5,7 +5,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http_body_util::{
@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Instant as TokioInstant, Sleep};
 
-use crate::{Algorithm, BackendHealthUpdate, LoadBalancer, Server};
+use crate::{Algorithm, BackendHealthUpdate, LoadBalancer, Server, ServerSnapshot};
 mod algos;
 use algos::least_connections::LeastConnections;
 use algos::least_response_time::LeastResponseTime;
@@ -184,7 +184,7 @@ fn render_report(snapshot: &ReportSnapshot) -> String {
     report
 }
 
-fn record_health_probe(server: &mut Server, started_at: Instant, healthy: bool, latency: Duration) {
+fn record_health_probe(server: &Server, started_at: Instant, healthy: bool, latency: Duration) {
     server.record_health_update(BackendHealthUpdate::Probe {
         started_at,
         healthy,
@@ -316,26 +316,34 @@ fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
 
 #[tokio::main]
 pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // starts the load balancer
-    let lb = Arc::new(Mutex::new(lb));
+    let algo = lb.algo;
+    let config = Arc::new(crate::RuntimeConfig {
+        load_balancer: lb.load_balancer,
+        timeout: lb.timeout,
+        client_upload_timeout: lb.client_upload_timeout,
+        health_check_timeout: lb.health_check_timeout,
+        health_check_interval: lb.health_check_interval,
+        report: lb.report,
+        save_file: lb.save_file,
+        save: lb.save,
+    });
+    let servers: Arc<[Arc<Server>]> = lb
+        .servers
+        .into_iter()
+        .map(Arc::new)
+        .collect::<Vec<_>>()
+        .into();
     let connector = HttpConnector::new();
     let backend_client: Arc<BackendClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(connector));
     let health_check_client = reqwest::Client::builder().build()?;
 
-    let (health_check_interval, len, health_check_timeout, report, save, save_file) = {
-        // gets health check interval and number of servers
-        let lb_lock = lb.lock().unwrap();
-        (
-            lb_lock.health_check_interval,
-            lb_lock.servers.len(),
-            lb_lock.health_check_timeout,
-            lb_lock.report,
-            lb_lock.save,
-            lb_lock.save_file.clone(),
-        )
-    };
-    let lb_clone = Arc::clone(&lb); //creates a clone for health checker
+    let health_check_interval = config.health_check_interval;
+    let health_check_timeout = config.health_check_timeout;
+    let report = config.report;
+    let save = config.save;
+    let save_file = config.save_file.clone();
+    let health_servers = Arc::clone(&servers);
 
     tokio::task::spawn(async move {
         let mut health_checks: u32 = 0;
@@ -346,19 +354,10 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
             health_checks = health_checks.saturating_add(1);
             let mut tasks = Vec::new();
 
-            for index in 0..len {
-                let lb_clone: Arc<Mutex<LoadBalancer>> = Arc::clone(&lb_clone);
+            for server in health_servers.iter().cloned() {
                 let health_check_client = health_check_client.clone();
 
                 let task = tokio::task::spawn(async move {
-                    let server = {
-                        let lb = lb_clone.lock().unwrap();
-                        lb.servers.get(index).cloned()
-                    };
-                    let Some(server) = server else {
-                        return;
-                    };
-
                     let probe_started_at = Instant::now();
                     let response = timeout(
                         health_check_timeout,
@@ -373,10 +372,7 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
                         Ok(Ok(response)) if response.status().is_success()
                     );
 
-                    let mut lb = lb_clone.lock().unwrap();
-                    if let Some(server) = lb.servers.get_mut(index) {
-                        record_health_probe(server, probe_started_at, healthy, latency);
-                    }
+                    record_health_probe(&server, probe_started_at, healthy, latency);
                 });
                 tasks.push(task);
             }
@@ -386,23 +382,22 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
             }
 
             if report || save {
-                let snapshot = {
-                    let lb = lb_clone.lock().unwrap();
-                    ReportSnapshot {
-                        health_check: health_checks,
-                        probe_interval: health_check_interval,
-                        servers: lb
-                            .servers
-                            .iter()
-                            .map(|server| ServerReportSnapshot {
+                let snapshot = ReportSnapshot {
+                    health_check: health_checks,
+                    probe_interval: health_check_interval,
+                    servers: health_servers
+                        .iter()
+                        .map(|server| {
+                            let metrics = server.snapshot();
+                            ServerReportSnapshot {
                                 addr: server.addr.clone(),
-                                alive: server.alive,
-                                probe_latency: server.health_check_response_time,
-                                conns: server.connections,
-                                conns_served: server.connections_served,
-                            })
-                            .collect(),
-                    }
+                                alive: metrics.alive,
+                                probe_latency: metrics.health_check_response_time,
+                                conns: metrics.connections,
+                                conns_served: metrics.connections_served,
+                            }
+                        })
+                        .collect(),
                 };
                 let report_text = render_report(&snapshot);
 
@@ -437,37 +432,26 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
         }
     });
 
-    let algo = {
-        let lb_lock = lb.lock().unwrap();
-        lb_lock.algo.clone()
+    let load_balancer: Arc<dyn Loadbalancer> = match algo {
+        Algorithm::RoundRobin => Arc::new(RoundRobin::new()),
+        Algorithm::WeightedRoundRobin => Arc::new(WeightedRoundRobin::new()),
+        Algorithm::LeastConnections => Arc::new(LeastConnections::new()),
+        Algorithm::WeightedLeastConnections => Arc::new(WeightedLeastConnections::new()),
+        Algorithm::LeastResponseTime => Arc::new(LeastResponseTime::new()),
+        Algorithm::WeightedLeastResponseTime => Arc::new(WeightedLeastResponseTime::new()),
     };
-
-    let load_balancer: Arc<Mutex<dyn Loadbalancer>> = match algo {
-        Algorithm::RoundRobin => Arc::new(Mutex::new(RoundRobin::new())),
-        Algorithm::WeightedRoundRobin => Arc::new(Mutex::new(WeightedRoundRobin::new())),
-        Algorithm::LeastConnections => Arc::new(Mutex::new(LeastConnections::new())),
-        Algorithm::WeightedLeastConnections => {
-            Arc::new(Mutex::new(WeightedLeastConnections::new()))
-        }
-        Algorithm::LeastResponseTime => Arc::new(Mutex::new(LeastResponseTime::new())),
-        Algorithm::WeightedLeastResponseTime => {
-            Arc::new(Mutex::new(WeightedLeastResponseTime::new()))
-        }
-    };
-    listen(lb, load_balancer, Arc::clone(&backend_client)).await?;
+    listen(config, servers, load_balancer, backend_client).await?;
 
     Ok(())
 }
 
-async fn listen<T>(
-    lb: Arc<Mutex<LoadBalancer>>,
-    load_balancer: Arc<Mutex<T>>,
+async fn listen(
+    config: Arc<crate::RuntimeConfig>,
+    servers: Arc<[Arc<Server>]>,
+    load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    T: Loadbalancer + ?Sized + 'static,
-{
-    let addr = uri_to_socket_addr(&lb.lock().unwrap().load_balancer).unwrap();
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = uri_to_socket_addr(&config.load_balancer).unwrap();
     let listener = match TcpListener::bind(addr).await {
         // We create a TcpListener and bind it to load balancer address
         Ok(listener) => {
@@ -488,7 +472,8 @@ where
         // `hyper::rt` IO traits.
         let io = TokioIo::new(stream);
 
-        let lb_clone = Arc::clone(&lb);
+        let config_clone = Arc::clone(&config);
+        let servers_clone = Arc::clone(&servers);
         let load_balancer_clone = Arc::clone(&load_balancer);
         let backend_client = Arc::clone(&backend_client);
 
@@ -500,7 +485,8 @@ where
                     service_fn(move |req| {
                         handle_request(
                             req,
-                            Arc::clone(&lb_clone),
+                            Arc::clone(&config_clone),
+                            Arc::clone(&servers_clone),
                             Arc::clone(&load_balancer_clone),
                             Arc::clone(&backend_client),
                         )
@@ -514,15 +500,13 @@ where
     }
 }
 
-async fn handle_request<T>(
+async fn handle_request(
     req: Request<Incoming>,
-    lb: Arc<Mutex<LoadBalancer>>,
-    load_balancer: Arc<Mutex<T>>,
+    config: Arc<crate::RuntimeConfig>,
+    servers: Arc<[Arc<Server>]>,
+    load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
-) -> Result<Response<ProxyBody>, Infallible>
-where
-    T: Loadbalancer + ?Sized,
-{
+) -> Result<Response<ProxyBody>, Infallible> {
     let request_started_at = Instant::now();
     let request_span = tracing::info_span!(
         "http.request",
@@ -559,7 +543,8 @@ where
             &parts.headers,
             body,
             &mut attempted,
-            Arc::clone(&lb),
+            Arc::clone(&config),
+            Arc::clone(&servers),
             Arc::clone(&load_balancer),
             Arc::clone(&backend_client),
             request_span.clone(),
@@ -648,37 +633,27 @@ fn failure_response(failure: ProxyFailure) -> Response<ProxyBody> {
 }
 
 struct ConnectionGuard {
-    lb: Arc<Mutex<LoadBalancer>>,
-    index: usize,
+    server: Arc<Server>,
     response_latency: Option<Duration>,
 }
 
 impl ConnectionGuard {
     fn mark_failed(&self) {
         let observed_at = Instant::now();
-        if let Ok(mut lb) = self.lb.lock() {
-            if let Some(server) = lb.servers.get_mut(self.index) {
-                server.record_health_update(BackendHealthUpdate::RequestFailure { observed_at });
-            }
-        }
+        self.server
+            .record_health_update(BackendHealthUpdate::RequestFailure { observed_at });
     }
 
     fn record_completed_latency(&self) {
-        if let (Some(latency), Ok(mut lb)) = (self.response_latency, self.lb.lock()) {
-            if let Some(server) = lb.servers.get_mut(self.index) {
-                server.record_request_latency(latency);
-            }
+        if let Some(latency) = self.response_latency {
+            self.server.record_request_latency(latency);
         }
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if let Ok(mut lb) = self.lb.lock() {
-            if let Some(server) = lb.servers.get_mut(self.index) {
-                server.connections = server.connections.saturating_sub(1);
-            }
-        }
+        self.server.release_connection();
     }
 }
 
@@ -800,62 +775,47 @@ fn empty_request_body() -> RequestBody {
         .boxed_unsync()
 }
 
-async fn get_request<T>(
+async fn get_request(
     method: &Method,
     incoming_uri: &Uri,
     version: Version,
     headers: &HeaderMap,
     body: RequestBody,
     attempted: &mut HashSet<usize>,
-    lb: Arc<Mutex<LoadBalancer>>,
-    load_balancer: Arc<Mutex<T>>,
+    config: Arc<crate::RuntimeConfig>,
+    servers: Arc<[Arc<Server>]>,
+    load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
     request_span: tracing::Span,
     request_started_at: Instant,
-) -> Result<Response<ProxyBody>, ProxyFailure>
-where
-    T: Loadbalancer + ?Sized,
-{
-    let (timeout_duration, client_upload_timeout, index, uri) = {
-        let mut lb = lb.lock().unwrap();
-
-        let is_eligible = |index: usize, server: &Server| {
+) -> Result<Response<ProxyBody>, ProxyFailure> {
+    let (index, server, uri) = loop {
+        let is_eligible = |index: usize, server: &ServerSnapshot| {
             server.alive
                 && server.connections < server.max_connections
                 && !attempted.contains(&index)
         };
 
-        let Some(index) = load_balancer
-            .lock()
-            .unwrap()
-            .get_index(&lb.servers, &is_eligible)
-        else {
+        let Some(index) = load_balancer.get_index(&servers, &is_eligible) else {
+            return Err(ProxyFailure::NoBackend);
+        };
+        let Some(server) = servers.get(index).cloned() else {
             return Err(ProxyFailure::NoBackend);
         };
 
-        let Some(server) = lb.servers.get(index) else {
-            return Err(ProxyFailure::NoBackend);
-        };
-
-        request_span.record("backend_index", index + 1);
-        let backend = server.addr.clone();
         attempted.insert(index);
-        let uri = backend_uri(&backend, incoming_uri).map_err(|_| ProxyFailure::BadGateway)?;
-
-        lb.servers[index].connections += 1;
-        lb.servers[index].connections_served += 1;
-
-        (
-            lb.servers[index].request_timeout.unwrap_or(lb.timeout),
-            lb.client_upload_timeout,
-            index,
-            uri,
-        )
+        let uri = backend_uri(&server.addr, incoming_uri).map_err(|_| ProxyFailure::BadGateway)?;
+        if server.try_reserve() {
+            break (index, server, uri);
+        }
     };
 
+    request_span.record("backend_index", index + 1);
+    let timeout_duration = server.request_timeout.unwrap_or(config.timeout);
+    let client_upload_timeout = config.client_upload_timeout;
+
     let mut connection = ConnectionGuard {
-        lb: Arc::clone(&lb),
-        index,
+        server,
         response_latency: None,
     };
     match send_request(
@@ -1063,10 +1023,10 @@ fn classify_upload_state(upload_state: u8) -> SendFailure {
     }
 }
 
-pub trait Loadbalancer: Send {
+pub trait Loadbalancer: Send + Sync {
     fn get_index(
-        &mut self,
-        servers: &[Server],
-        is_eligible: &dyn Fn(usize, &Server) -> bool,
+        &self,
+        servers: &[Arc<Server>],
+        is_eligible: &dyn Fn(usize, &crate::ServerSnapshot) -> bool,
     ) -> Option<usize>;
 }

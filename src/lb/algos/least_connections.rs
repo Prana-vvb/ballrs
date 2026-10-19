@@ -1,5 +1,6 @@
 use crate::lb::Loadbalancer;
 use crate::Server;
+use std::sync::Arc;
 
 pub struct LeastConnections {}
 
@@ -11,15 +12,18 @@ impl LeastConnections {
 
 impl Loadbalancer for LeastConnections {
     fn get_index(
-        &mut self,
-        servers: &[Server],
-        is_eligible: &dyn Fn(usize, &Server) -> bool,
+        &self,
+        servers: &[Arc<Server>],
+        is_eligible: &dyn Fn(usize, &crate::ServerSnapshot) -> bool,
     ) -> Option<usize> {
         servers
             .iter()
             .enumerate()
-            .filter(|(index, server)| is_eligible(*index, server))
-            .min_by_key(|(_, server)| server.connections)
+            .filter_map(|(index, server)| {
+                let snapshot = server.snapshot();
+                is_eligible(index, &snapshot).then_some((index, snapshot))
+            })
+            .min_by_key(|(_, snapshot)| snapshot.connections)
             .map(|(index, _)| index)
     }
 }

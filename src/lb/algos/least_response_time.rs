@@ -1,5 +1,6 @@
 use crate::lb::Loadbalancer;
 use crate::Server;
+use std::sync::Arc;
 
 pub struct LeastResponseTime {}
 
@@ -11,14 +12,17 @@ impl LeastResponseTime {
 
 impl Loadbalancer for LeastResponseTime {
     fn get_index(
-        &mut self,
-        servers: &[Server],
-        is_eligible: &dyn Fn(usize, &Server) -> bool,
+        &self,
+        servers: &[Arc<Server>],
+        is_eligible: &dyn Fn(usize, &crate::ServerSnapshot) -> bool,
     ) -> Option<usize> {
         servers
             .iter()
             .enumerate()
-            .filter(|(index, server)| is_eligible(*index, server))
+            .filter_map(|(index, server)| {
+                let snapshot = server.snapshot();
+                is_eligible(index, &snapshot).then_some((index, snapshot))
+            })
             .fold(None, |best, candidate| match best {
                 None => Some(candidate),
                 Some((best_index, best_server)) => {

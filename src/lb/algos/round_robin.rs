@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::lb::Loadbalancer;
 use crate::Server;
+use std::sync::Arc;
 
 pub struct RoundRobin {
     counter: AtomicUsize,
@@ -17,14 +18,14 @@ impl RoundRobin {
 
 impl Loadbalancer for RoundRobin {
     fn get_index(
-        &mut self,
-        servers: &[Server],
-        is_eligible: &dyn Fn(usize, &Server) -> bool,
+        &self,
+        servers: &[Arc<Server>],
+        is_eligible: &dyn Fn(usize, &crate::ServerSnapshot) -> bool,
     ) -> Option<usize> {
         let eligible_count = servers
             .iter()
             .enumerate()
-            .filter(|(index, server)| is_eligible(*index, server))
+            .filter(|(index, server)| is_eligible(*index, &server.snapshot()))
             .count();
         if eligible_count == 0 {
             return None;
@@ -34,7 +35,7 @@ impl Loadbalancer for RoundRobin {
         servers
             .iter()
             .enumerate()
-            .filter(|(index, server)| is_eligible(*index, server))
+            .filter(|(index, server)| is_eligible(*index, &server.snapshot()))
             .nth(selected)
             .map(|(index, _)| index)
     }
