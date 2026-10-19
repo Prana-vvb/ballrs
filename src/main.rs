@@ -350,13 +350,6 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
                         .short('s')
                         .long("save")
                         .help("Saves report data to specified file"),
-                )
-                .arg(
-                    Arg::new("save config")
-                        .short('w')
-                        .long("write")
-                        .action(ArgAction::SetTrue)
-                        .help("Writes CLI config changes to config.yaml"),
                 ),
         )
         .get_matches();
@@ -370,8 +363,6 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
             let algorithm = start_args.get_one::<String>("algorithm");
             let report = start_args.get_one::<bool>("report");
             let save = start_args.get_one::<String>("save file");
-            let write = start_args.get_one::<bool>("save config");
-            let config_path = path.map(String::as_str).unwrap_or("config.yaml");
 
             if let Some(path) = path {
                 lb.servers = Vec::new();
@@ -393,10 +384,6 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
             if let Some(save) = save {
                 lb.save_file.clone_from(save);
                 lb.save = true;
-            }
-
-            if write.copied().unwrap_or(false) {
-                write_to_config(&lb, config_path)?;
             }
 
             lb::start_lb(lb)?;
@@ -430,75 +417,4 @@ fn get_algo(algo: &str) -> io::Result<Algorithm> {
     };
 
     Ok(algorithm)
-}
-
-fn write_to_config(lb: &LoadBalancer, path: &str) -> io::Result<()> {
-    let algorithm = match lb.algo {
-        Algorithm::RoundRobin => "round_robin",
-        Algorithm::WeightedRoundRobin => "weighted_round_robin",
-        Algorithm::LeastConnections => "least_connections",
-        Algorithm::WeightedLeastConnections => "weighted_least_connections",
-        Algorithm::LeastResponseTime => "least_response_time",
-        Algorithm::WeightedLeastResponseTime => "weighted_least_response_time",
-    };
-    let servers = lb
-        .servers
-        .iter()
-        .map(|server| server.addr.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let weights = lb
-        .servers
-        .iter()
-        .map(|server| server.weight.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let max_connections = lb
-        .servers
-        .iter()
-        .map(|server| server.max_connections.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let server_timeouts = lb
-        .servers
-        .iter()
-        .map(|server| {
-            server
-                .request_timeout
-                .map(|timeout| timeout.as_secs().to_string())
-                .unwrap_or_else(|| "default".to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let health_check_paths = lb
-        .servers
-        .iter()
-        .map(|server| server.health_check_path.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let health_check_timeouts = lb
-        .servers
-        .iter()
-        .map(|server| server.health_check_timeout.as_secs().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let config = format!(
-        "load balancer: {}\nalgorithm: {}\nservers: {}\nweights: {}\nmax connections: {}\ntimeout: {}\nclient upload timeout: {}\nserver timeouts: {}\nhealth check timeout: {}\nhealth check paths: {}\nhealth check timeouts: {}\nhealth check interval: {}\nhealth check healthy threshold: {}\nhealth check unhealthy threshold: {}\n",
-        lb.load_balancer,
-        algorithm,
-        servers,
-        weights,
-        max_connections,
-        lb.timeout.as_secs(),
-        lb.client_upload_timeout.as_secs(),
-        server_timeouts,
-        lb.health_check_timeout.as_secs(),
-        health_check_paths,
-        health_check_timeouts,
-        lb.health_check_interval.as_secs(),
-        lb.health_check_healthy_threshold,
-        lb.health_check_unhealthy_threshold,
-    );
-
-    std::fs::write(path, config)
 }
