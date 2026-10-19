@@ -166,7 +166,6 @@ impl Server {
                     }
                     metrics.availability_updated_at = started_at;
                 }
-                return;
             }
             BackendHealthUpdate::RequestFailure { observed_at } => {
                 if observed_at >= metrics.availability_updated_at {
@@ -174,7 +173,6 @@ impl Server {
                     metrics.alive = false;
                     metrics.availability_updated_at = observed_at;
                 }
-                return;
             }
         };
     }
@@ -219,7 +217,7 @@ impl Server {
                 consecutive_probe_successes: 0,
                 consecutive_probe_failures: 0,
                 connections: 0,
-                alive: true,
+                alive: false,
                 availability_updated_at: Instant::now(),
                 connections_served: 0,
             }),

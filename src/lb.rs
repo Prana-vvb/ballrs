@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -18,11 +18,11 @@ use hyper::service::service_fn;
 use hyper::{body::Bytes, HeaderMap, Method, Request, Response, Uri, Version};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::net::{lookup_host, TcpListener};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant as TokioInstant, Sleep};
 
 use crate::{Algorithm, BackendHealthUpdate, LoadBalancer, Server, ServerSnapshot};
@@ -301,17 +301,99 @@ impl HttpBody for MonitoredRequestBody {
     }
 }
 
-fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, &'static str> {
-    // takes Uri and returns SocketAddr
-    let authority = uri
-        .authority()
-        .ok_or("URI does not have an authority part")?; // Ensure the URI has an authority part (host and port)
+async fn uri_to_socket_addrs(uri: &Uri) -> std::io::Result<Vec<SocketAddr>> {
+    let authority = uri.authority().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "URI has no authority")
+    })?;
 
-    let host = authority.host(); // Extract host and port
-    let port = authority.port_u16().ok_or("URI does not have a port")?;
+    let authority_host = authority.host();
+    let host = authority_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(authority_host);
+    let port = authority.port_u16().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "URI has no explicit port")
+    })?;
 
-    let addr_str = format!("{}:{}", host, port); // Combine host and port into a SocketAddr
-    SocketAddr::from_str(&addr_str).map_err(|_| "Failed to parse SocketAddr")
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addresses = deduplicate_socket_addrs(lookup_host((host, port)).await?);
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("hostname {host:?} resolved to no listener addresses"),
+        ));
+    }
+    Ok(addresses)
+}
+
+fn deduplicate_socket_addrs(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    addresses
+        .into_iter()
+        .filter(|address| seen.insert(*address))
+        .collect()
+}
+
+async fn bind_available_listeners(
+    addresses: &[SocketAddr],
+) -> (Vec<(SocketAddr, TcpListener)>, Vec<String>) {
+    let mut listeners = Vec::with_capacity(addresses.len());
+    let mut bind_errors = Vec::new();
+    for &address in addresses {
+        match TcpListener::bind(address).await {
+            Ok(listener) => {
+                tracing::info!(%address, "Load balancer listener is running");
+                listeners.push((address, listener));
+            }
+            Err(error) => {
+                tracing::warn!(%address, %error, "Failed to bind listener address");
+                bind_errors.push(format!("{address}: {error}"));
+            }
+        }
+    }
+
+    (listeners, bind_errors)
+}
+
+async fn serve_listener(
+    address: SocketAddr,
+    listener: TcpListener,
+    config: Arc<crate::RuntimeConfig>,
+    servers: Arc<[Arc<Server>]>,
+    load_balancer: Arc<dyn Loadbalancer>,
+    backend_client: Arc<BackendClient>,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+
+        let config = Arc::clone(&config);
+        let servers = Arc::clone(&servers);
+        let load_balancer = Arc::clone(&load_balancer);
+        let backend_client = Arc::clone(&backend_client);
+        tokio::task::spawn(async move {
+            if let Err(error) = http1::Builder::new()
+                .serve_connection(
+                    io,
+                    service_fn(move |request| {
+                        handle_request(
+                            request,
+                            Arc::clone(&config),
+                            Arc::clone(&servers),
+                            Arc::clone(&load_balancer),
+                            Arc::clone(&backend_client),
+                        )
+                    }),
+                )
+                .await
+            {
+                tracing::error!(%address, error = %error, "Error serving downstream connection");
+            }
+        });
+    }
 }
 
 #[tokio::main]
@@ -452,53 +534,47 @@ async fn listen(
     load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = uri_to_socket_addr(&config.load_balancer).unwrap();
-    let listener = match TcpListener::bind(addr).await {
-        // We create a TcpListener and bind it to load balancer address
-        Ok(listener) => {
-            tracing::info!(%addr, "Load balancer is running");
-            listener
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "Failed to bind load balancer listener");
-            return Ok(());
-        }
-    };
+    let addresses = uri_to_socket_addrs(&config.load_balancer)
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to resolve listener URI {}: {error}",
+                    config.load_balancer
+                ),
+            )
+        })?;
 
-    loop {
-        // starting a loop to continuously accept incoming connections
-        let (stream, _) = listener.accept().await?;
-
-        // Use an adapter to access something implementing `tokio::io` traits as if they implement
-        // `hyper::rt` IO traits.
-        let io = TokioIo::new(stream);
-
-        let config_clone = Arc::clone(&config);
-        let servers_clone = Arc::clone(&servers);
-        let load_balancer_clone = Arc::clone(&load_balancer);
-        let backend_client = Arc::clone(&backend_client);
-
-        tokio::task::spawn(async move {
-            // spawns a tokio task to server multiple connections concurrently
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| {
-                        handle_request(
-                            req,
-                            Arc::clone(&config_clone),
-                            Arc::clone(&servers_clone),
-                            Arc::clone(&load_balancer_clone),
-                            Arc::clone(&backend_client),
-                        )
-                    }),
-                )
-                .await
-            {
-                tracing::error!(error = %err, "Error serving downstream connection");
-            }
-        });
+    let (listeners, bind_errors) = bind_available_listeners(&addresses).await;
+    if listeners.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!(
+                "failed to bind any address for listener URI {} ({})",
+                config.load_balancer,
+                bind_errors.join("; ")
+            ),
+        )
+        .into());
     }
+
+    let mut listener_tasks = JoinSet::new();
+    for (address, listener) in listeners {
+        listener_tasks.spawn(serve_listener(
+            address,
+            listener,
+            Arc::clone(&config),
+            Arc::clone(&servers),
+            Arc::clone(&load_balancer),
+            Arc::clone(&backend_client),
+        ));
+    }
+
+    while let Some(result) = listener_tasks.join_next().await {
+        result??;
+    }
+    Ok(())
 }
 
 async fn handle_request(
