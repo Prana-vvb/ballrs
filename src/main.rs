@@ -1,5 +1,5 @@
+use anyhow::{Context, Result};
 use clap::{command, Arg, ArgAction, Command};
-use std::error::Error;
 use std::io;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -228,7 +228,7 @@ impl Server {
 impl LoadBalancer {
     fn new() -> Self {
         LoadBalancer {
-            load_balancer: "http://127.0.0.1:8000".parse::<hyper::Uri>().unwrap(), // default address for load balancer
+            load_balancer: hyper::Uri::from_static("http://127.0.0.1:8000"),
             algo: Algorithm::RoundRobin, // using round robin as default algorithm
             servers: Vec::new(),
             timeout: Duration::from_secs(0),
@@ -242,9 +242,11 @@ impl LoadBalancer {
             save: false,
         }
     }
-    fn update(&mut self, path: &str) -> io::Result<&LoadBalancer> {
-        let config = config::load(path)?;
-        let algorithm = get_algo(&config.algorithm)?;
+    fn update(&mut self, path: &str) -> Result<&LoadBalancer> {
+        let config = config::load(path)
+            .with_context(|| format!("failed to load configuration from {path:?}"))?;
+        let algorithm =
+            get_algo(&config.algorithm).context("invalid algorithm in configuration")?;
         self.load_balancer = config.load_balancer;
         self.algo = algorithm;
         self.servers = config
@@ -284,23 +286,19 @@ enum Algorithm {
     WeightedLeastResponseTime,
 }
 
-fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .try_init()?;
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))?;
 
-    let mut lb = LoadBalancer::new();
-    lb.update("config.yaml")?;
-
-    cli(lb)
-    // drop(lb::start_lb(lb));
-    // Ok(())
+    cli(LoadBalancer::new())
 }
 
-fn cli(mut lb: LoadBalancer) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn cli(mut lb: LoadBalancer) -> Result<()> {
     let res = command!()
         .arg_required_else_help(true)
         .about(
@@ -355,24 +353,29 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
     match res.subcommand_name() {
         Some("start") => {
             tracing::info!("Starting load balancer");
-            let start_args = res.subcommand_matches("start").unwrap();
-            let path = start_args.get_one::<String>("path");
+            let start_args = res
+                .subcommand_matches("start")
+                .context("start subcommand arguments were unavailable")?;
+            let path = start_args
+                .get_one::<String>("path")
+                .context("configuration path argument was unavailable")?;
             let address = start_args.get_one::<String>("address");
             let algorithm = start_args.get_one::<String>("algorithm");
             let report = start_args.get_one::<bool>("report");
             let save = start_args.get_one::<String>("save file");
 
-            if let Some(path) = path {
-                lb.servers = Vec::new();
-                lb.update(path)?;
-            }
+            lb.update(path)?;
 
             if let Some(address) = address {
-                lb.load_balancer = address.trim().parse::<hyper::Uri>().unwrap();
+                lb.load_balancer = address.trim().parse::<hyper::Uri>().with_context(|| {
+                    format!("invalid listener URI supplied by --address: {address:?}")
+                })?;
             }
 
             if let Some(algorithm) = algorithm {
-                lb.algo = get_algo(algorithm)?;
+                lb.algo = get_algo(algorithm).with_context(|| {
+                    format!("invalid algorithm supplied by --algorithm: {algorithm:?}")
+                })?;
             }
 
             if let Some(report) = report {
@@ -384,9 +387,10 @@ weighted_least_connections/wlc, least_response_time/lrt, weighted_least_response
                 lb.save = true;
             }
 
-            lb::start_lb(lb)?;
+            lb::start_lb(lb)
+                .context("load balancer failed during startup or listener operation")?;
         }
-        _ => println!("Invalid command"),
+        _ => anyhow::bail!("missing `start` subcommand"),
     }
 
     Ok(())

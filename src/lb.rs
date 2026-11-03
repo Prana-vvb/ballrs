@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use anyhow::{anyhow, Context as AnyhowContext};
 use http_body_util::{
     combinators::{BoxBody, UnsyncBoxBody},
     BodyExt, Full,
@@ -365,9 +366,12 @@ async fn serve_listener(
     servers: Arc<[Arc<Server>]>,
     load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
-) -> std::io::Result<()> {
+) -> anyhow::Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| format!("listener {address} failed while accepting a connection"))?;
         let io = TokioIo::new(stream);
 
         let config = Arc::clone(&config);
@@ -397,7 +401,7 @@ async fn serve_listener(
 }
 
 #[tokio::main]
-pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
     let algo = lb.algo;
     let config = Arc::new(crate::RuntimeConfig {
         load_balancer: lb.load_balancer,
@@ -417,7 +421,9 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
     let connector = HttpConnector::new();
     let backend_client: Arc<BackendClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(connector));
-    let health_check_client = reqwest::Client::builder().build()?;
+    let health_check_client = reqwest::Client::builder()
+        .build()
+        .context("failed to initialize health-check HTTP client")?;
 
     let health_check_interval = config.health_check_interval;
     let report = config.report;
@@ -523,7 +529,9 @@ pub async fn start_lb(lb: LoadBalancer) -> Result<(), Box<dyn std::error::Error 
         Algorithm::LeastResponseTime => Arc::new(LeastResponseTime::new()),
         Algorithm::WeightedLeastResponseTime => Arc::new(WeightedLeastResponseTime::new()),
     };
-    listen(config, servers, load_balancer, backend_client).await?;
+    listen(config, servers, load_balancer, backend_client)
+        .await
+        .context("listener setup or serving failed")?;
 
     Ok(())
 }
@@ -533,30 +541,18 @@ async fn listen(
     servers: Arc<[Arc<Server>]>,
     load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<()> {
     let addresses = uri_to_socket_addrs(&config.load_balancer)
         .await
-        .map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to resolve listener URI {}: {error}",
-                    config.load_balancer
-                ),
-            )
-        })?;
+        .with_context(|| format!("failed to resolve listener URI {}", config.load_balancer))?;
 
     let (listeners, bind_errors) = bind_available_listeners(&addresses).await;
     if listeners.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!(
-                "failed to bind any address for listener URI {} ({})",
-                config.load_balancer,
-                bind_errors.join("; ")
-            ),
-        )
-        .into());
+        return Err(anyhow!(
+            "failed to bind any address for listener URI {} ({})",
+            config.load_balancer,
+            bind_errors.join("; ")
+        ));
     }
 
     let mut listener_tasks = JoinSet::new();
@@ -572,7 +568,7 @@ async fn listen(
     }
 
     while let Some(result) = listener_tasks.join_next().await {
-        result??;
+        result.context("listener task failed to join")??;
     }
     Ok(())
 }
