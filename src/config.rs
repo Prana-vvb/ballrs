@@ -19,6 +19,7 @@ pub(crate) struct ServerConfig {
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) load_balancer: Uri,
+    pub(crate) max_client_connections: usize,
     pub(crate) algorithm: String,
     pub(crate) servers: Vec<ServerConfig>,
     pub(crate) timeout: Duration,
@@ -76,6 +77,8 @@ impl RawServerTimeout {
 struct RawConfig {
     #[serde(rename = "load balancer")]
     load_balancer: String,
+    #[serde(rename = "max client connections")]
+    max_client_connections: Option<usize>,
     algorithm: String,
     servers: Option<RawList<String>>,
     weights: Option<RawList<u32>>,
@@ -104,6 +107,7 @@ impl Default for RawConfig {
     fn default() -> Self {
         Self {
             load_balancer: String::from("http://127.0.0.1:8000"),
+            max_client_connections: None,
             algorithm: String::from("round_robin"),
             servers: None,
             weights: None,
@@ -132,14 +136,51 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
         )
     })?;
 
-    let load_balancer = parse_value("load balancer", &raw.load_balancer)?;
+    let load_balancer: Uri = parse_value("load balancer", &raw.load_balancer)?;
+    if load_balancer.scheme_str() != Some("http") {
+        return Err(invalid_value(
+            "load balancer",
+            &raw.load_balancer,
+            "listener accepts plaintext HTTP only; terminate TLS before Balrs",
+        ));
+    }
+    if load_balancer.authority().is_none() {
+        return Err(invalid_value(
+            "load balancer",
+            &raw.load_balancer,
+            "expected an HTTP URL with a host and explicit port",
+        ));
+    }
+    if load_balancer
+        .authority()
+        .and_then(|authority| authority.port_u16())
+        .is_none()
+    {
+        return Err(invalid_value(
+            "load balancer",
+            &raw.load_balancer,
+            "listener URL must include an explicit port",
+        ));
+    }
     let server_addr_values = raw
         .servers
         .ok_or_else(|| missing_field("servers"))?
         .into_values(|value| Ok(value.to_owned()))?;
     let server_addrs = server_addr_values
         .iter()
-        .map(|value| parse_value("servers", value))
+        .map(|value| {
+            let address: Uri = parse_value("servers", value)?;
+            if !matches!(address.scheme_str(), Some("http" | "https"))
+                || address.authority().is_none()
+            {
+                return Err(invalid_value(
+                    "servers",
+                    value,
+                    "expected an absolute http:// or https:// backend URL",
+                ));
+            }
+            Ok(address)
+        })
         .collect::<io::Result<Vec<Uri>>>()?;
     if server_addrs.is_empty() {
         return Err(invalid_value(
@@ -282,9 +323,18 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
             "must be greater than zero",
         ));
     }
+    let max_client_connections = raw.max_client_connections.unwrap_or(1024);
+    if max_client_connections == 0 {
+        return Err(invalid_value(
+            "max client connections",
+            "0",
+            "must be greater than zero",
+        ));
+    }
 
     Ok(Config {
         load_balancer,
+        max_client_connections,
         algorithm: raw.algorithm,
         servers,
         timeout,

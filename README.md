@@ -48,5 +48,8 @@ The `config.yaml` file allows you to customize the Load Balancer settings:
 - <mark>**Servers**</mark>: List of server URLs to which Balrs can send requests
 - <mark>**Weights**</mark>: List of weights of respective servers, used by weighted load balancing algorithms
 - <mark>**Max connections**</mark>: List of the maximum number of connections each server is allowed to handle
+- <mark>**Max client connections**</mark>: Global maximum number of downstream TCP connections across listener addresses (Default: 1024); new connections are closed when the limit is full
 - <mark>**Timeout**</mark>: Maximum time allowed for a server to respond before it is marked as dead
 - <mark>**Health check interval**</mark>: Time interval at which server health checks are performed
+
+The listener accepts plaintext HTTP/1 only; terminate inbound TLS in front of Ballrs. Backend URLs may use `http://` or `https://` and use HTTP/1. HTTPS certificates are verified against the system root certificate store.

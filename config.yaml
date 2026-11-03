@@ -1,12 +1,16 @@
 # load balancer address
 load balancer: http://127.0.0.1:8000
 
+# max simultaneous downstream TCP connections across all listener addresses
+# excess connections are closed; default is 1024
+max client connections: 1024
+
 # load balancer algorithm to use
 # round_robin, weighted_round_robin, least_connections
 # weighted_least_connections, least_response_time, weighted_least_response_time
 algorithm: round_robin
 
-# backend server addresses
+# backend server addresses (http:// or https://; HTTPS uses system-trusted certificates)
 servers: http://127.0.0.1:3001, http://127.0.0.1:3002, http://127.0.0.1:3003
 
 # backend server weights per server defined

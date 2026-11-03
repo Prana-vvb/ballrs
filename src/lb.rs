@@ -17,12 +17,13 @@ use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Bytes, HeaderMap, Method, Request, Response, Uri, Version};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpListener};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant as TokioInstant, Sleep};
 
@@ -38,7 +39,8 @@ use algos::weighted_round_robin::WeightedRoundRobin;
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
 type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
-type BackendClient = Client<HttpConnector, RequestBody>;
+type BackendConnector = HttpsConnector<HttpConnector>;
+type BackendClient = Client<BackendConnector, RequestBody>;
 
 struct ReportSnapshot {
     health_check: u32,
@@ -366,12 +368,25 @@ async fn serve_listener(
     servers: Arc<[Arc<Server>]>,
     load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
+    connection_limit: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .with_context(|| format!("listener {address} failed while accepting a connection"))?;
+        let connection_permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::debug!(
+                    %address,
+                    limit = config.max_client_connections,
+                    "Closing downstream connection because the global connection limit is full"
+                );
+                drop(stream);
+                continue;
+            }
+        };
         let io = TokioIo::new(stream);
 
         let config = Arc::clone(&config);
@@ -379,6 +394,7 @@ async fn serve_listener(
         let load_balancer = Arc::clone(&load_balancer);
         let backend_client = Arc::clone(&backend_client);
         tokio::task::spawn(async move {
+            let _connection_permit: OwnedSemaphorePermit = connection_permit;
             if let Err(error) = http1::Builder::new()
                 .serve_connection(
                     io,
@@ -405,6 +421,7 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
     let algo = lb.algo;
     let config = Arc::new(crate::RuntimeConfig {
         load_balancer: lb.load_balancer,
+        max_client_connections: lb.max_client_connections,
         timeout: lb.timeout,
         client_upload_timeout: lb.client_upload_timeout,
         health_check_interval: lb.health_check_interval,
@@ -418,7 +435,12 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
         .map(Arc::new)
         .collect::<Vec<_>>()
         .into();
-    let connector = HttpConnector::new();
+    let connector = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .context("failed to load system TLS root certificates")?
+        .https_or_http()
+        .enable_http1()
+        .build();
     let backend_client: Arc<BackendClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(connector));
     let health_check_client = reqwest::Client::builder()
@@ -556,6 +578,7 @@ async fn listen(
     }
 
     let mut listener_tasks = JoinSet::new();
+    let connection_limit = Arc::new(Semaphore::new(config.max_client_connections));
     for (address, listener) in listeners {
         listener_tasks.spawn(serve_listener(
             address,
@@ -564,6 +587,7 @@ async fn listen(
             Arc::clone(&servers),
             Arc::clone(&load_balancer),
             Arc::clone(&backend_client),
+            Arc::clone(&connection_limit),
         ));
     }
 
