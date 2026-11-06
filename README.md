@@ -57,11 +57,11 @@ The listener accepts plaintext HTTP/1 only; terminate inbound TLS in front of Ba
 
 ### Benchmarks
 
-Install ApacheBench (`ab`), then build Balrs and run the persistent benchmark harness:
+Install Hey (`go install github.com/rakyll/hey@v0.1.5`) and put its Go bin directory on `PATH`, then build Balrs and run the persistent benchmark harness:
 
 ```sh
 cargo build --release --bin Ballrs
 cargo bench --bench bench
 ```
 
-The harness starts a local HTTP/1.1 fixture, runs ApacheBench across the direct backend and all six algorithms, and writes a timestamped CSV. It also compares `backend tcp nodelay: false` and `true` for round-robin streamed POSTs. Use `cargo bench --bench bench -- --quick` for a short smoke run, or add `--output path.csv` to choose an output path.
+The harness follows the Loggly/Hey load profile with one million requests per case at concurrency 50, 250, and 500. The comparison workload is a fixed 1 KiB GET sent to the direct backend and each of the six Balrs algorithms. A supplemental streamed 64 KiB POST set compares the direct backend with round-robin using the default backend socket setting and with backend `TCP_NODELAY` enabled; this targets the streamed upload performance question without multiplying the full matrix. Hey reports request rate, latency percentiles, status codes, and transport errors; results go to a timestamped CSV. HTTPS listener testing is omitted because Balrs currently accepts plaintext HTTP only. Use `cargo bench --bench bench -- --quick` for a 1,000-request smoke run, or add `--output path.csv` to choose a CSV path.

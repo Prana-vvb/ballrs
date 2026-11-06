@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "Balrs"
+name = "Ballrs"
 version = "0.1.0"
 dependencies = [
  "anyhow",

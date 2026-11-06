@@ -25,7 +25,7 @@ const ALGORITHMS: [&str; 6] = [
     "least_response_time",
     "weighted_least_response_time",
 ];
-const CONCURRENCIES: [usize; 3] = [1, 8, 32];
+const CONCURRENCIES: [usize; 3] = [50, 250, 500];
 const BODY_SIZE: usize = 64 * 1024;
 
 struct Options {
@@ -67,9 +67,12 @@ impl Workload {
 
 struct Metrics {
     requests_per_second: f64,
-    failed: u64,
     duration_seconds: f64,
+    status_200: u64,
+    status_other: u64,
+    transport_errors: u64,
     p50_ms: f64,
+    p90_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
 }
@@ -79,7 +82,6 @@ struct Row {
     workload: String,
     tcp_nodelay: String,
     concurrency: usize,
-    repetition: usize,
     metrics: Metrics,
 }
 
@@ -98,9 +100,7 @@ fn parse_options() -> Result<Options> {
             }
             "--help" | "-h" => {
                 println!("Usage: cargo bench --bench bench -- [--quick] [--output PATH]");
-                println!(
-                    "  --quick       Use 10 warmups, 100 measured requests, and one repetition"
-                );
+                println!("  --quick       Use 1,000 requests per benchmark case");
                 println!("  --output PATH Write CSV results to PATH (default: timestamped file)");
                 std::process::exit(0);
             }
@@ -110,20 +110,16 @@ fn parse_options() -> Result<Options> {
     Ok(Options { quick, output })
 }
 
-fn ab_path() -> Result<PathBuf> {
-    let fixed = Path::new("/sbin/ab");
-    if fixed.is_file() {
-        return Ok(fixed.to_owned());
-    }
+fn hey_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
-            let candidate = directory.join("ab");
+            let candidate = directory.join("hey");
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
     }
-    bail!("ApacheBench is required; install `ab` or put it on PATH")
+    bail!("Hey is required; install github.com/rakyll/hey and put `hey` on PATH")
 }
 
 async fn backend_service(
@@ -206,7 +202,7 @@ fn write_config(
         .join(", ");
     let yaml = format!(
         "load balancer: http://{listener}\n\
-         max client connections: 256\n\
+         max client connections: 2048\n\
          backend tcp nodelay: {tcp_nodelay}\n\
          algorithm: {algorithm}\n\
          servers: {backend_urls}\n\
@@ -260,85 +256,141 @@ async fn wait_ready(address: SocketAddr, process: &mut RunningBalancer) -> Resul
     }
 }
 
-fn parse_ab(output: &str) -> Result<Metrics> {
-    fn value(output: &str, prefix: &str) -> Result<f64> {
+fn parse_hey(output: &str) -> Result<Metrics> {
+    fn summary_number(output: &str, label: &str) -> Result<f64> {
         let line = output
             .lines()
-            .find(|line| line.trim_start().starts_with(prefix))
-            .with_context(|| format!("ApacheBench output omitted {prefix:?}"))?;
+            .find(|line| line.trim_start().starts_with(label))
+            .with_context(|| format!("Hey output omitted {label:?}"))?;
         line.split_whitespace()
             .find_map(|part| part.parse::<f64>().ok())
-            .with_context(|| format!("could not parse ApacheBench line {line:?}"))
+            .with_context(|| format!("could not parse Hey summary line {line:?}"))
     }
 
-    fn percentile(output: &str, prefix: &str) -> Result<f64> {
-        let line = output
+    fn status_count(output: &str, status: &str) -> u64 {
+        output
             .lines()
-            .find(|line| line.trim_start().starts_with(prefix))
-            .with_context(|| format!("ApacheBench output omitted percentile {prefix:?}"))?;
-        line.split_whitespace()
-            .find_map(|part| part.parse::<f64>().ok())
-            .with_context(|| format!("could not parse ApacheBench percentile {line:?}"))
+            .find(|line| line.trim().starts_with(&format!("[{status}]")))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0)
     }
 
-    let failed = value(output, "Failed requests:")? as u64;
-    if failed != 0 {
-        bail!("ApacheBench reported {failed} failed requests\n{output}");
+    fn percentile_seconds(output: &str, percentile: u8) -> Result<f64> {
+        let marker = "Latency distribution:";
+        let distribution = output
+            .split_once(marker)
+            .map(|(_, rest)| rest)
+            .context("Hey output omitted latency distribution")?;
+        let prefix = format!("{percentile}%% in");
+        let line = distribution
+            .lines()
+            .find(|line| line.trim_start().starts_with(&prefix))
+            .with_context(|| format!("Hey output omitted p{percentile}"))?;
+        line.split_whitespace()
+            .find_map(|part| part.parse::<f64>().ok())
+            .with_context(|| format!("could not parse Hey percentile line {line:?}"))
     }
+
+    let status_200 = status_count(output, "200");
+    let status_other: u64 = output
+        .split_once("Status code distribution:")
+        .map(|(_, rest)| {
+            rest.lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    let status = line.strip_prefix('[')?.split(']').next()?;
+                    if status == "200" {
+                        return None;
+                    }
+                    line.split_whitespace().nth(1)?.parse::<u64>().ok()
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    let transport_errors: u64 = output
+        .split_once("Error distribution:")
+        .map(|(_, rest)| {
+            rest.lines()
+                .filter_map(|line| line.trim().split(']').next()?.strip_prefix('['))
+                .filter_map(|count| count.parse::<u64>().ok())
+                .sum()
+        })
+        .unwrap_or(0);
+
     Ok(Metrics {
-        requests_per_second: value(output, "Requests per second:")?,
-        failed,
-        duration_seconds: value(output, "Time taken for tests:")?,
-        p50_ms: percentile(output, "50%")?,
-        p95_ms: percentile(output, "95%")?,
-        p99_ms: percentile(output, "99%")?,
+        requests_per_second: summary_number(output, "Requests/sec:")?,
+        duration_seconds: summary_number(output, "Total:")?,
+        status_200,
+        status_other,
+        transport_errors,
+        p50_ms: percentile_seconds(output, 50)? * 1000.0,
+        p90_ms: percentile_seconds(output, 90)? * 1000.0,
+        p95_ms: percentile_seconds(output, 95)? * 1000.0,
+        p99_ms: percentile_seconds(output, 99)? * 1000.0,
     })
 }
 
-fn run_ab(
-    ab: &Path,
+fn run_hey(
+    hey: &Path,
     url: &str,
     body_path: &Path,
     workload: Workload,
     concurrency: usize,
     count: usize,
 ) -> Result<Metrics> {
-    let mut command = Command::new(ab);
-    command.args(["-n", &count.max(concurrency).to_string()]);
-    command.args(["-c", &concurrency.to_string(), "-k", "-q"]);
+    let mut command = Command::new(hey);
+    command.args([
+        "-n",
+        &count.max(concurrency).to_string(),
+        "-c",
+        &concurrency.to_string(),
+        "-t",
+        "120",
+        "-disable-compression",
+    ]);
     if matches!(workload, Workload::Post64K) {
-        command.args(["-p", body_path.to_str().context("non-UTF8 body path")?]);
-        command.args(["-T", "application/octet-stream"]);
+        command.args([
+            "-m",
+            "POST",
+            "-D",
+            body_path.to_str().context("non-UTF8 body path")?,
+            "-T",
+            "application/octet-stream",
+        ]);
     }
     command.arg(url);
-    let output = command.output().context("failed to run ApacheBench")?;
+    let output = command.output().context("failed to run Hey")?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     if !output.status.success() {
-        bail!("ApacheBench exited with {}\n{text}", output.status);
+        bail!("Hey exited with {}\n{text}", output.status);
     }
-    parse_ab(&text)
+    parse_hey(&text).with_context(|| format!("failed to parse Hey output:\n{text}"))
 }
 
 fn write_csv(path: &Path, rows: &[Row]) -> Result<()> {
     let mut csv = String::from(
-        "target,workload,tcp_nodelay,concurrency,repetition,requests_per_second,failed,duration_seconds,p50_ms,p95_ms,p99_ms\n",
+        "target,workload,tcp_nodelay,concurrency,requests,requests_per_second,duration_seconds,status_200,status_other,transport_errors,p50_ms,p90_ms,p95_ms,p99_ms\n",
     );
     for row in rows {
         csv.push_str(&format!(
-            "{},{},{},{},{},{:.2},{},{:.3},{:.1},{:.1},{:.1}\n",
+            "{},{},{},{},{},{:.2},{:.3},{},{},{},{:.3},{:.3},{:.3},{:.3}\n",
             row.target,
             row.workload,
             row.tcp_nodelay,
             row.concurrency,
-            row.repetition,
+            row.metrics.status_200 + row.metrics.status_other + row.metrics.transport_errors,
             row.metrics.requests_per_second,
-            row.metrics.failed,
             row.metrics.duration_seconds,
+            row.metrics.status_200,
+            row.metrics.status_other,
+            row.metrics.transport_errors,
             row.metrics.p50_ms,
+            row.metrics.p90_ms,
             row.metrics.p95_ms,
             row.metrics.p99_ms,
         ));
@@ -352,44 +404,41 @@ fn default_output_path() -> PathBuf {
 }
 
 async fn run_scenario(
-    ab: &Path,
+    hey: &Path,
     target: &str,
     nodelay: Option<bool>,
     base_url: &str,
     workload: Workload,
     concurrency: usize,
-    warmup: usize,
     requests: usize,
-    repetitions: usize,
     body_path: &Path,
     rows: &mut Vec<Row>,
 ) -> Result<()> {
-    run_ab(ab, base_url, body_path, workload, concurrency, warmup)?;
-    for repetition in 1..=repetitions {
-        let metrics = run_ab(ab, base_url, body_path, workload, concurrency, requests)?;
-        println!(
-            "{target:28} {:10} nodelay={:<5} c={concurrency:2} r={repetition} {:9.1} req/s p95={:.1}ms p99={:.1}ms",
-            workload.name(),
-            nodelay.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
-            metrics.requests_per_second,
-            metrics.p95_ms,
-            metrics.p99_ms,
-        );
-        rows.push(Row {
-            target: target.to_owned(),
-            workload: workload.name().to_owned(),
-            tcp_nodelay: nodelay.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
-            concurrency,
-            repetition,
-            metrics,
-        });
-    }
+    let metrics = run_hey(hey, base_url, body_path, workload, concurrency, requests)?;
+    println!(
+        "{target:28} {:10} nodelay={:<5} c={concurrency:3} {:9.1} req/s p95={:.3}ms p99={:.3}ms 200={} other={} errors={}",
+        workload.name(),
+        nodelay.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+        metrics.requests_per_second,
+        metrics.p95_ms,
+        metrics.p99_ms,
+        metrics.status_200,
+        metrics.status_other,
+        metrics.transport_errors,
+    );
+    rows.push(Row {
+        target: target.to_owned(),
+        workload: workload.name().to_owned(),
+        tcp_nodelay: nodelay.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+        concurrency,
+        metrics,
+    });
     Ok(())
 }
 
 async fn run() -> Result<()> {
     let options = parse_options()?;
-    let ab = ab_path()?;
+    let hey = hey_path()?;
     let binary = binary_path()?;
     let artifacts = artifact_dir()?;
     let body_path = artifacts.0.join("post-64k.bin");
@@ -404,11 +453,7 @@ async fn run() -> Result<()> {
         backend_tasks.push(task);
     }
 
-    let warmup = if options.quick { 10 } else { 1_000 };
-    let requests = if options.quick { 100 } else { 10_000 };
-    let repetitions = if options.quick { 1 } else { 3 };
-    let workloads = [Workload::Get, Workload::Post64K];
-    let scenarios = workloads.len() * CONCURRENCIES.len();
+    let requests = if options.quick { 1_000 } else { 1_000_000 };
     let targets = std::iter::once("direct")
         .chain(ALGORITHMS.iter().copied())
         .collect::<Vec<_>>();
@@ -429,29 +474,15 @@ async fn run() -> Result<()> {
                 .await
                 .with_context(|| format!("Balrs target {target} failed readiness"))?;
 
-            let mut order = Vec::new();
-            for workload in workloads {
-                for concurrency in CONCURRENCIES {
-                    order.push((workload, concurrency));
-                }
-            }
-            let shift = ALGORITHMS
-                .iter()
-                .position(|algorithm| *algorithm == target)
-                .unwrap_or(0)
-                % scenarios;
-            order.rotate_left(shift);
-            for (workload, concurrency) in order {
+            for concurrency in CONCURRENCIES {
                 run_scenario(
-                    &ab,
+                    &hey,
                     target,
                     Some(false),
                     &format!("http://{address}/"),
-                    workload,
+                    Workload::Get,
                     concurrency,
-                    warmup,
                     requests,
-                    repetitions,
                     &body_path,
                     &mut rows,
                 )
@@ -461,23 +492,15 @@ async fn run() -> Result<()> {
             continue;
         };
 
-        let mut order = Vec::new();
-        for workload in workloads {
-            for concurrency in CONCURRENCIES {
-                order.push((workload, concurrency));
-            }
-        }
-        for (workload, concurrency) in order {
+        for concurrency in CONCURRENCIES {
             run_scenario(
-                &ab,
+                &hey,
                 target,
                 None,
                 &base_url,
-                workload,
+                Workload::Get,
                 concurrency,
-                warmup,
                 requests,
-                repetitions,
                 &body_path,
                 &mut rows,
             )
@@ -485,7 +508,50 @@ async fn run() -> Result<()> {
         }
     }
 
-    // Reuse the ordinary round-robin POST rows as the false side of the A/B comparison.
+    // Streamed POST is a focused comparison for the proxy path under investigation:
+    // direct backend, round-robin with the default socket setting, and round-robin
+    // with backend TCP_NODELAY enabled.
+    for concurrency in CONCURRENCIES {
+        run_scenario(
+            &hey,
+            "direct",
+            None,
+            &format!("http://{}/", backend_addrs[0]),
+            Workload::Post64K,
+            concurrency,
+            requests,
+            &body_path,
+            &mut rows,
+        )
+        .await?;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let config_path = artifacts.0.join("round_robin_post.yaml");
+    let log_path = artifacts.0.join("round_robin_post.log");
+    write_config(&config_path, address, &backend_addrs, "round_robin", false)?;
+    let mut process = start_balancer(&binary, &config_path, &log_path).await?;
+    wait_ready(address, &mut process)
+        .await
+        .context("round-robin POST target failed readiness")?;
+    for concurrency in CONCURRENCIES {
+        run_scenario(
+            &hey,
+            "round_robin",
+            Some(false),
+            &format!("http://{address}/"),
+            Workload::Post64K,
+            concurrency,
+            requests,
+            &body_path,
+            &mut rows,
+        )
+        .await?;
+    }
+    drop(process);
+
+    // Compare round-robin backend TCP_NODELAY enabled against the default setting.
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     drop(listener);
@@ -498,15 +564,13 @@ async fn run() -> Result<()> {
         .context("Balrs with backend TCP_NODELAY enabled failed readiness")?;
     for concurrency in CONCURRENCIES {
         run_scenario(
-            &ab,
+            &hey,
             "round_robin",
             Some(true),
             &format!("http://{address}/"),
             Workload::Post64K,
             concurrency,
-            warmup,
             requests,
-            repetitions,
             &body_path,
             &mut rows,
         )
