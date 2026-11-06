@@ -23,7 +23,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpListener};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant as TokioInstant, Sleep};
 
@@ -369,12 +369,20 @@ async fn serve_listener(
     load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
     connection_limit: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .with_context(|| format!("listener {address} failed while accepting a connection"))?;
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() {
+                    return Ok(());
+                }
+                continue;
+            }
+            result = listener.accept() => result
+                .with_context(|| format!("listener {address} failed while accepting a connection"))?,
+        };
+        let (stream, _) = accepted;
         let connection_permit = match Arc::clone(&connection_limit).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -456,13 +464,22 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
     let save = config.save;
     let save_file = config.save_file.clone();
     let health_servers = Arc::clone(&servers);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    tokio::task::spawn(async move {
+    let health_task = tokio::task::spawn(async move {
         let mut health_checks: u32 = 0;
         let mut health_check_timer = tokio::time::interval(health_check_interval);
         health_check_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown = shutdown_rx;
         loop {
-            health_check_timer.tick().await;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        break;
+                    }
+                }
+                _ = health_check_timer.tick() => {}
+            }
             health_checks = health_checks.saturating_add(1);
             let mut tasks = Vec::new();
 
@@ -555,9 +572,21 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
         Algorithm::LeastResponseTime => Arc::new(LeastResponseTime::new()),
         Algorithm::WeightedLeastResponseTime => Arc::new(WeightedLeastResponseTime::new()),
     };
-    listen(config, servers, load_balancer, backend_client)
+    let listen_result = listen(
+        config,
+        servers,
+        load_balancer,
+        backend_client,
+        shutdown_tx.clone(),
+        shutdown_tx.subscribe(),
+    )
+    .await
+    .context("listener setup or serving failed");
+    let _ = shutdown_tx.send(true);
+    health_task
         .await
-        .context("listener setup or serving failed")?;
+        .context("health-check task failed to join")?;
+    listen_result?;
 
     Ok(())
 }
@@ -567,6 +596,8 @@ async fn listen(
     servers: Arc<[Arc<Server>]>,
     load_balancer: Arc<dyn Loadbalancer>,
     backend_client: Arc<BackendClient>,
+    shutdown: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let addresses = uri_to_socket_addrs(&config.load_balancer)
         .await
@@ -592,13 +623,48 @@ async fn listen(
             Arc::clone(&load_balancer),
             Arc::clone(&backend_client),
             Arc::clone(&connection_limit),
+            shutdown_rx.clone(),
         ));
     }
 
-    while let Some(result) = listener_tasks.join_next().await {
-        result.context("listener task failed to join")??;
+    loop {
+        tokio::select! {
+            signal = shutdown_signal() => {
+                signal.context("failed to listen for shutdown signal")?;
+                tracing::info!("Shutdown signal received; stopping listeners");
+                let _ = shutdown.send(true);
+                while let Some(result) = listener_tasks.join_next().await {
+                    result.context("listener task failed to join")??;
+                }
+                break;
+            }
+            result = listener_tasks.join_next() => {
+                match result {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => return Err(error).context("listener task failed to join"),
+                    None => break,
+                }
+            }
+        }
     }
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 async fn handle_request(
