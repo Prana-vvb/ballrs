@@ -371,12 +371,17 @@ async fn serve_listener(
     connection_limit: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let mut connection_tasks = JoinSet::new();
     loop {
         let accepted = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow_and_update() {
-                    return Ok(());
+                    break;
                 }
+                continue;
+            }
+            result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                result.context("connection task set unexpectedly became empty")??;
                 continue;
             }
             result = listener.accept() => result
@@ -401,9 +406,10 @@ async fn serve_listener(
         let servers = Arc::clone(&servers);
         let load_balancer = Arc::clone(&load_balancer);
         let backend_client = Arc::clone(&backend_client);
-        tokio::task::spawn(async move {
+        let mut connection_shutdown = shutdown.clone();
+        connection_tasks.spawn(async move {
             let _connection_permit: OwnedSemaphorePermit = connection_permit;
-            if let Err(error) = http1::Builder::new()
+            let connection = http1::Builder::new()
                 .serve_connection(
                     io,
                     service_fn(move |request| {
@@ -415,13 +421,30 @@ async fn serve_listener(
                             Arc::clone(&backend_client),
                         )
                     }),
-                )
-                .await
-            {
-                tracing::error!(%address, error = %error, "Error serving downstream connection");
+                );
+            tokio::pin!(connection);
+            tokio::select! {
+                result = &mut connection => {
+                    if let Err(error) = result {
+                        tracing::error!(%address, error = %error, "Error serving downstream connection");
+                    }
+                }
+                changed = connection_shutdown.changed() => {
+                    if changed.is_err() || *connection_shutdown.borrow_and_update() {
+                        connection.as_mut().graceful_shutdown();
+                        if let Err(error) = connection.await {
+                            tracing::error!(%address, error = %error, "Error draining downstream connection");
+                        }
+                    }
+                }
             }
         });
     }
+
+    while let Some(result) = connection_tasks.join_next().await {
+        result.context("connection task failed to join")?;
+    }
+    Ok(())
 }
 
 #[tokio::main]
