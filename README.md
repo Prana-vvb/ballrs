@@ -49,7 +49,19 @@ The `config.yaml` file allows you to customize the Load Balancer settings:
 - <mark>**Weights**</mark>: List of weights of respective servers, used by weighted load balancing algorithms
 - <mark>**Max connections**</mark>: List of the maximum number of connections each server is allowed to handle
 - <mark>**Max client connections**</mark>: Global maximum number of downstream TCP connections across listener addresses (Default: 1024); new connections are closed when the limit is full
+- <mark>**Backend TCP_NODELAY**</mark>: Enables `TCP_NODELAY` on backend TCP connections (Default: false)
 - <mark>**Timeout**</mark>: Maximum time allowed for a server to respond before it is marked as dead
 - <mark>**Health check interval**</mark>: Time interval at which server health checks are performed
 
-The listener accepts plaintext HTTP/1 only; terminate inbound TLS in front of Ballrs. Backend URLs may use `http://` or `https://` and use HTTP/1. HTTPS certificates are verified against the system root certificate store.
+The listener accepts plaintext HTTP/1 only; terminate inbound TLS in front of Balrs. Backend URLs may use `http://` or `https://` and use HTTP/1. HTTPS certificates are verified against the system root certificate store.
+
+### Benchmarks
+
+Install ApacheBench (`ab`), then build Balrs and run the persistent benchmark harness:
+
+```sh
+cargo build --release --bin Ballrs
+cargo bench --bench bench
+```
+
+The harness starts a local HTTP/1.1 fixture, runs ApacheBench across the direct backend and all six algorithms, and writes a timestamped CSV. It also compares `backend tcp nodelay: false` and `true` for round-robin streamed POSTs. Use `cargo bench --bench bench -- --quick` for a short smoke run, or add `--output path.csv` to choose an output path.

@@ -20,6 +20,7 @@ pub(crate) struct ServerConfig {
 pub(crate) struct Config {
     pub(crate) load_balancer: Uri,
     pub(crate) max_client_connections: usize,
+    pub(crate) backend_tcp_nodelay: bool,
     pub(crate) algorithm: String,
     pub(crate) servers: Vec<ServerConfig>,
     pub(crate) timeout: Duration,
@@ -79,6 +80,8 @@ struct RawConfig {
     load_balancer: String,
     #[serde(rename = "max client connections")]
     max_client_connections: Option<usize>,
+    #[serde(rename = "backend tcp nodelay")]
+    backend_tcp_nodelay: bool,
     algorithm: String,
     servers: Option<RawList<String>>,
     weights: Option<RawList<u32>>,
@@ -108,6 +111,7 @@ impl Default for RawConfig {
         Self {
             load_balancer: String::from("http://127.0.0.1:8000"),
             max_client_connections: None,
+            backend_tcp_nodelay: false,
             algorithm: String::from("round_robin"),
             servers: None,
             weights: None,
@@ -335,6 +339,7 @@ pub(crate) fn load(path: &str) -> io::Result<Config> {
     Ok(Config {
         load_balancer,
         max_client_connections,
+        backend_tcp_nodelay: raw.backend_tcp_nodelay,
         algorithm: raw.algorithm,
         servers,
         timeout,

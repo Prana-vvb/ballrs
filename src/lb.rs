@@ -422,6 +422,7 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
     let config = Arc::new(crate::RuntimeConfig {
         load_balancer: lb.load_balancer,
         max_client_connections: lb.max_client_connections,
+        backend_tcp_nodelay: lb.backend_tcp_nodelay,
         timeout: lb.timeout,
         client_upload_timeout: lb.client_upload_timeout,
         health_check_interval: lb.health_check_interval,
@@ -435,12 +436,15 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
         .map(Arc::new)
         .collect::<Vec<_>>()
         .into();
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
+    http_connector.set_nodelay(config.backend_tcp_nodelay);
     let connector = HttpsConnectorBuilder::new()
         .with_native_roots()
         .context("failed to load system TLS root certificates")?
         .https_or_http()
         .enable_http1()
-        .build();
+        .wrap_connector(http_connector);
     let backend_client: Arc<BackendClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(connector));
     let health_check_client = reqwest::Client::builder()

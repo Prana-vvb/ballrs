@@ -5,6 +5,10 @@ load balancer: http://127.0.0.1:8000
 # excess connections are closed; default is 1024
 max client connections: 1024
 
+# disable Nagle's algorithm on backend TCP connections
+# default: false
+backend tcp nodelay: false
+
 # load balancer algorithm to use
 # round_robin, weighted_round_robin, least_connections
 # weighted_least_connections, least_response_time, weighted_least_response_time

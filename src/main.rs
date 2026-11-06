@@ -11,6 +11,7 @@ mod lb;
 struct LoadBalancer {
     load_balancer: hyper::Uri,
     max_client_connections: usize,
+    backend_tcp_nodelay: bool,
     algo: Algorithm,
     servers: Vec<Server>,
     timeout: Duration,
@@ -28,6 +29,7 @@ struct LoadBalancer {
 struct RuntimeConfig {
     load_balancer: hyper::Uri,
     max_client_connections: usize,
+    backend_tcp_nodelay: bool,
     timeout: Duration,
     client_upload_timeout: Duration,
     health_check_interval: Duration,
@@ -232,6 +234,7 @@ impl LoadBalancer {
         LoadBalancer {
             load_balancer: hyper::Uri::from_static("http://127.0.0.1:8000"),
             max_client_connections: 1024,
+            backend_tcp_nodelay: false,
             algo: Algorithm::RoundRobin, // using round robin as default algorithm
             servers: Vec::new(),
             timeout: Duration::from_secs(0),
@@ -252,6 +255,7 @@ impl LoadBalancer {
             get_algo(&config.algorithm).context("invalid algorithm in configuration")?;
         self.load_balancer = config.load_balancer;
         self.max_client_connections = config.max_client_connections;
+        self.backend_tcp_nodelay = config.backend_tcp_nodelay;
         self.algo = algorithm;
         self.servers = config
             .servers
