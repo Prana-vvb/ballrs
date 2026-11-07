@@ -42,6 +42,38 @@ type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
 type BackendConnector = HttpsConnector<HttpConnector>;
 type BackendClient = Client<BackendConnector, RequestBody>;
 
+pub(crate) struct ProxyState {
+    pub(crate) config: Arc<crate::RuntimeConfig>,
+    pub(crate) servers: Arc<[Arc<Server>]>,
+    pub(crate) load_balancer: Arc<dyn Loadbalancer>,
+    pub(crate) backend_client: Arc<BackendClient>,
+}
+
+pub(crate) struct RequestMetrics {
+    pub(crate) attempted: HashSet<usize>,
+    pub(crate) request_span: tracing::Span,
+    pub(crate) request_started_at: Instant,
+}
+
+pub(crate) struct IncomingParts {
+    pub(crate) method: Method,
+    pub(crate) incoming_uri: Uri,
+    pub(crate) version: Version,
+    pub(crate) headers: HeaderMap,
+}
+
+#[derive(Clone, Copy)]
+struct RequestTimeoutConfig {
+    response: Duration,
+    upload_idle: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct ListenerContext {
+    pub(crate) proxy: Arc<ProxyState>,
+    pub(crate) connection_limit: Arc<Semaphore>,
+}
+
 struct ReportSnapshot {
     health_check: u32,
     probe_interval: Duration,
@@ -139,6 +171,7 @@ fn render_report(snapshot: &ReportSnapshot) -> String {
         .servers
         .iter()
         .fold(Duration::ZERO, |total, server| total + server.probe_latency);
+
     let avg_probe_latency = if snapshot.servers.is_empty() {
         None
     } else {
@@ -166,6 +199,7 @@ fn render_report(snapshot: &ReportSnapshot) -> String {
             );
         }
     }
+
     let _ = writeln!(report, "Summary");
     let _ = writeln!(
         report,
@@ -174,6 +208,7 @@ fn render_report(snapshot: &ReportSnapshot) -> String {
     );
     let _ = writeln!(report, "Active connections: {active_conns}");
     let _ = writeln!(report, "Connections served: {conns_served}");
+
     match avg_probe_latency {
         Some(latency) => {
             let _ = writeln!(report, "Average probe latency: {latency:?}");
@@ -222,6 +257,7 @@ impl MonitoredRequestBody {
         let started_at = already_complete.then(Instant::now);
         let mut started_signal = Some(started_signal);
         let mut completion = Some(completion);
+
         if already_complete {
             state.store(UPLOAD_COMPLETE, Ordering::Release);
             if let Some(signal) = started_signal.take() {
@@ -231,6 +267,7 @@ impl MonitoredRequestBody {
                 let _ = signal.send(started_at);
             }
         }
+
         Self {
             inner: Box::pin(inner),
             idle_deadline: Box::pin(tokio::time::sleep(idle_timeout)),
@@ -268,6 +305,7 @@ impl HttpBody for MonitoredRequestBody {
                 let _ = started_signal.send(());
             }
         }
+
         if this.idle_deadline.as_mut().poll(cx).is_ready() {
             this.finish(UPLOAD_TIMED_OUT, None);
             return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
@@ -329,6 +367,7 @@ async fn uri_to_socket_addrs(uri: &Uri) -> std::io::Result<Vec<SocketAddr>> {
             format!("hostname {host:?} resolved to no listener addresses"),
         ));
     }
+
     Ok(addresses)
 }
 
@@ -345,6 +384,7 @@ async fn bind_available_listeners(
 ) -> (Vec<(SocketAddr, TcpListener)>, Vec<String>) {
     let mut listeners = Vec::with_capacity(addresses.len());
     let mut bind_errors = Vec::new();
+
     for &address in addresses {
         match TcpListener::bind(address).await {
             Ok(listener) => {
@@ -364,11 +404,7 @@ async fn bind_available_listeners(
 async fn serve_listener(
     address: SocketAddr,
     listener: TcpListener,
-    config: Arc<crate::RuntimeConfig>,
-    servers: Arc<[Arc<Server>]>,
-    load_balancer: Arc<dyn Loadbalancer>,
-    backend_client: Arc<BackendClient>,
-    connection_limit: Arc<Semaphore>,
+    context: ListenerContext,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut connection_tasks = JoinSet::new();
@@ -387,13 +423,14 @@ async fn serve_listener(
             result = listener.accept() => result
                 .with_context(|| format!("listener {address} failed while accepting a connection"))?,
         };
+
         let (stream, _) = accepted;
-        let connection_permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+        let connection_permit = match Arc::clone(&context.connection_limit).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::debug!(
                     %address,
-                    limit = config.max_client_connections,
+                    limit = context.proxy.config.max_client_connections,
                     "Closing downstream connection because the global connection limit is full"
                 );
                 drop(stream);
@@ -402,26 +439,19 @@ async fn serve_listener(
         };
         let io = TokioIo::new(stream);
 
-        let config = Arc::clone(&config);
-        let servers = Arc::clone(&servers);
-        let load_balancer = Arc::clone(&load_balancer);
-        let backend_client = Arc::clone(&backend_client);
+        let proxy = Arc::clone(&context.proxy);
         let mut connection_shutdown = shutdown.clone();
+
         connection_tasks.spawn(async move {
             let _connection_permit: OwnedSemaphorePermit = connection_permit;
             let connection = http1::Builder::new()
                 .serve_connection(
                     io,
                     service_fn(move |request| {
-                        handle_request(
-                            request,
-                            Arc::clone(&config),
-                            Arc::clone(&servers),
-                            Arc::clone(&load_balancer),
-                            Arc::clone(&backend_client),
-                        )
+                        handle_request(request, Arc::clone(&proxy))
                     }),
                 );
+
             tokio::pin!(connection);
             tokio::select! {
                 result = &mut connection => {
@@ -429,6 +459,7 @@ async fn serve_listener(
                         tracing::error!(%address, error = %error, "Error serving downstream connection");
                     }
                 }
+
                 changed = connection_shutdown.changed() => {
                     if changed.is_err() || *connection_shutdown.borrow_and_update() {
                         connection.as_mut().graceful_shutdown();
@@ -444,6 +475,7 @@ async fn serve_listener(
     while let Some(result) = connection_tasks.join_next().await {
         result.context("connection task failed to join")?;
     }
+
     Ok(())
 }
 
@@ -468,8 +500,10 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .into();
     let mut http_connector = HttpConnector::new();
+
     http_connector.enforce_http(false);
     http_connector.set_nodelay(config.backend_tcp_nodelay);
+
     let connector = HttpsConnectorBuilder::new()
         .with_native_roots()
         .context("failed to load system TLS root certificates")?
@@ -511,10 +545,10 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
 
                 let task = tokio::task::spawn(async move {
                     let probe_started_at = Instant::now();
-                    let healthy = match backend_uri(&server.addr, &server.health_check_path) {
+                    let healthy = match backend_uri(&server.addr, &server.health_check.path) {
                         Ok(uri) => matches!(
                             timeout(
-                                server.health_check_timeout,
+                                server.health_check.timeout,
                                 health_check_client.get(uri.to_string()).send(),
                             )
                             .await,
@@ -529,6 +563,7 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
 
                     record_health_probe(&server, probe_started_at, healthy, latency);
                 });
+
                 tasks.push(task);
             }
 
@@ -554,6 +589,7 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
                         })
                         .collect(),
                 };
+
                 let report_text = render_report(&snapshot);
 
                 if report {
@@ -605,6 +641,7 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
     )
     .await
     .context("listener setup or serving failed");
+
     let _ = shutdown_tx.send(true);
     health_task
         .await
@@ -637,15 +674,20 @@ async fn listen(
 
     let mut listener_tasks = JoinSet::new();
     let connection_limit = Arc::new(Semaphore::new(config.max_client_connections));
+    let listener_context = ListenerContext {
+        proxy: Arc::new(ProxyState {
+            config,
+            servers,
+            load_balancer,
+            backend_client,
+        }),
+        connection_limit,
+    };
     for (address, listener) in listeners {
         listener_tasks.spawn(serve_listener(
             address,
             listener,
-            Arc::clone(&config),
-            Arc::clone(&servers),
-            Arc::clone(&load_balancer),
-            Arc::clone(&backend_client),
-            Arc::clone(&connection_limit),
+            listener_context.clone(),
             shutdown_rx.clone(),
         ));
     }
@@ -671,6 +713,7 @@ async fn listen(
             }
         }
     }
+
     Ok(())
 }
 
@@ -692,10 +735,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
 async fn handle_request(
     req: Request<Incoming>,
-    config: Arc<crate::RuntimeConfig>,
-    servers: Arc<[Arc<Server>]>,
-    load_balancer: Arc<dyn Loadbalancer>,
-    backend_client: Arc<BackendClient>,
+    proxy: Arc<ProxyState>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let request_started_at = Instant::now();
     let request_span = tracing::info_span!(
@@ -706,10 +746,16 @@ async fn handle_request(
         status = tracing::field::Empty,
     );
     let (parts, body) = req.into_parts();
+    let incoming = IncomingParts {
+        method: parts.method,
+        incoming_uri: parts.uri,
+        version: parts.version,
+        headers: parts.headers,
+    };
     let body_is_empty = body.is_end_stream() && body.size_hint().exact() == Some(0);
     let retryable = body_is_empty
         && matches!(
-            parts.method.as_str(),
+            incoming.method.as_str(),
             "GET" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "TRACE"
         );
     let mut request_body = Some(
@@ -721,36 +767,30 @@ async fn handle_request(
         }})
         .boxed_unsync(),
     );
-    let mut attempted = HashSet::new();
+    let mut metrics = RequestMetrics {
+        attempted: HashSet::new(),
+        request_span,
+        request_started_at,
+    };
     let mut last_failure = None;
 
     loop {
         let body = request_body.take().unwrap_or_else(empty_request_body);
-        match get_request(
-            &parts.method,
-            &parts.uri,
-            parts.version,
-            &parts.headers,
-            body,
-            &mut attempted,
-            Arc::clone(&config),
-            Arc::clone(&servers),
-            Arc::clone(&load_balancer),
-            Arc::clone(&backend_client),
-            request_span.clone(),
-            request_started_at,
-        )
-        .await
-        {
+        match get_request(&proxy, &incoming, body, &mut metrics).await {
             Ok(response) => {
-                request_span.record("status", response.status().as_u16());
+                metrics
+                    .request_span
+                    .record("status", response.status().as_u16());
                 return Ok(response);
             }
             Err(ProxyFailure::NoBackend) => {
                 let failure = last_failure.unwrap_or(ProxyFailure::NoBackend);
                 let response = failure_response(failure);
-                request_span.record("status", response.status().as_u16());
-                tracing::warn!(parent: &request_span, outcome = "proxy_failed", status = response.status().as_u16(), "Request could not be sent to a backend");
+                metrics
+                    .request_span
+                    .record("status", response.status().as_u16());
+                tracing::warn!(parent: &metrics.request_span, outcome = "proxy_failed", status = response.status().as_u16(), "Request could not be sent to a backend");
+
                 return Ok(response);
             }
             Err(failure) => {
@@ -761,8 +801,11 @@ async fn handle_request(
                     )
                 {
                     let response = failure_response(failure);
-                    request_span.record("status", response.status().as_u16());
-                    tracing::warn!(parent: &request_span, outcome = "proxy_failed", status = response.status().as_u16(), "Request could not be completed");
+                    metrics
+                        .request_span
+                        .record("status", response.status().as_u16());
+                    tracing::warn!(parent: &metrics.request_span, outcome = "proxy_failed", status = response.status().as_u16(), "Request could not be completed");
+
                     return Ok(response);
                 }
                 last_failure = Some(match (last_failure, failure) {
@@ -880,6 +923,7 @@ impl StreamingBody {
         } else {
             tracing::info!(parent: &self.request_span, outcome = "complete", elapsed_ms, "Request completed");
         }
+
         if failed {
             if let Some(connection) = &self.connection {
                 connection.mark_failed();
@@ -931,6 +975,7 @@ impl HttpBody for StreamingBody {
             .expect("body checked above")
             .as_mut()
             .poll_frame(cx);
+
         match frame {
             Poll::Ready(Some(Ok(frame))) => {
                 let end_stream = this
@@ -940,6 +985,7 @@ impl HttpBody for StreamingBody {
                 if end_stream {
                     this.finish(false);
                 }
+
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -966,72 +1012,65 @@ fn empty_request_body() -> RequestBody {
 }
 
 async fn get_request(
-    method: &Method,
-    incoming_uri: &Uri,
-    version: Version,
-    headers: &HeaderMap,
+    proxy: &ProxyState,
+    incoming: &IncomingParts,
     body: RequestBody,
-    attempted: &mut HashSet<usize>,
-    config: Arc<crate::RuntimeConfig>,
-    servers: Arc<[Arc<Server>]>,
-    load_balancer: Arc<dyn Loadbalancer>,
-    backend_client: Arc<BackendClient>,
-    request_span: tracing::Span,
-    request_started_at: Instant,
+    metrics: &mut RequestMetrics,
 ) -> Result<Response<ProxyBody>, ProxyFailure> {
     let (index, server, uri) = loop {
         let is_eligible = |index: usize, server: &ServerSnapshot| {
             server.alive
                 && server.connections < server.max_connections
-                && !attempted.contains(&index)
+                && !metrics.attempted.contains(&index)
         };
 
-        let Some(index) = load_balancer.get_index(&servers, &is_eligible) else {
+        let Some(index) = proxy.load_balancer.get_index(&proxy.servers, &is_eligible) else {
             return Err(ProxyFailure::NoBackend);
         };
-        let Some(server) = servers.get(index).cloned() else {
+        let Some(server) = proxy.servers.get(index).cloned() else {
             return Err(ProxyFailure::NoBackend);
         };
 
-        attempted.insert(index);
-        let uri = backend_uri(&server.addr, incoming_uri).map_err(|_| ProxyFailure::BadGateway)?;
+        metrics.attempted.insert(index);
+        let uri = backend_uri(&server.addr, &incoming.incoming_uri)
+            .map_err(|_| ProxyFailure::BadGateway)?;
         if server.try_reserve() {
             break (index, server, uri);
         }
     };
 
-    request_span.record("backend_index", index + 1);
-    let timeout_duration = server.request_timeout.unwrap_or(config.timeout);
-    let client_upload_timeout = config.client_upload_timeout;
+    metrics.request_span.record("backend_index", index + 1);
+    let timeout_duration = server.request_timeout.unwrap_or(proxy.config.timeout);
+    let timeouts = RequestTimeoutConfig {
+        response: timeout_duration,
+        upload_idle: proxy.config.client_upload_timeout,
+    };
 
     let mut connection = ConnectionGuard {
         server,
         response_latency: None,
     };
-    match send_request(
-        backend_client.as_ref(),
-        uri,
-        method,
-        version,
-        headers,
-        body,
-        timeout_duration,
-        client_upload_timeout,
-    )
-    .await
-    {
+
+    match send_request(proxy.backend_client.as_ref(), uri, incoming, body, timeouts).await {
         Ok((response, backend_started_at, response_latency)) => {
             connection.response_latency = response_latency;
             let deadline = TokioInstant::from_std(backend_started_at + timeout_duration);
             let (parts, body) = response.into_parts();
-            let body =
-                StreamingBody::new(body, deadline, connection, request_span, request_started_at)
-                    .boxed();
+            let body = StreamingBody::new(
+                body,
+                deadline,
+                connection,
+                metrics.request_span.clone(),
+                metrics.request_started_at,
+            )
+            .boxed();
+
             Ok(Response::from_parts(parts, body))
         }
         Err(SendFailure::Backend) => {
-            tracing::error!(parent: &request_span, outcome = "backend_request_failed", "Backend request failed");
+            tracing::error!(parent: &metrics.request_span, outcome = "backend_request_failed", "Backend request failed");
             connection.mark_failed();
+
             Err(ProxyFailure::BadGateway)
         }
         Err(SendFailure::BackendTimeout) => {
@@ -1050,6 +1089,7 @@ fn backend_uri(backend: &Uri, incoming: &Uri) -> Result<Uri, String> {
     let scheme = backend.scheme_str().unwrap_or("http");
     let base_path = backend.path().trim_end_matches("/");
     let incoming_path = incoming.path();
+
     let path = if incoming_path == "*" {
         "*".to_owned()
     } else if base_path.is_empty() || base_path == "/" {
@@ -1066,6 +1106,7 @@ fn backend_uri(backend: &Uri, incoming: &Uri) -> Result<Uri, String> {
         (None, Some(request)) => Some(request.to_owned()),
         (None, None) => None,
     };
+
     let path_and_query = match query {
         Some(query) => format!("{path}?{query}"),
         None => path,
@@ -1082,26 +1123,23 @@ fn backend_uri(backend: &Uri, incoming: &Uri) -> Result<Uri, String> {
 async fn send_request(
     client: &BackendClient,
     uri: Uri,
-    method: &Method,
-    version: Version,
-    headers: &HeaderMap,
+    incoming: &IncomingParts,
     body: RequestBody,
-    response_timeout: Duration,
-    upload_idle_timeout: Duration,
+    timeouts: RequestTimeoutConfig,
 ) -> Result<(Response<Incoming>, Instant, Option<Duration>), SendFailure> {
     let upload_state = Arc::new(AtomicU8::new(UPLOAD_ACTIVE));
     let (upload_started_tx, mut upload_started_rx) = oneshot::channel();
     let (upload_completed_tx, mut upload_completed_rx) = oneshot::channel();
     let body = MonitoredRequestBody::new(
         body,
-        upload_idle_timeout,
+        timeouts.upload_idle,
         Arc::clone(&upload_state),
         upload_started_tx,
         upload_completed_tx,
     )
     .boxed_unsync();
 
-    let mut forwarded_headers = headers.clone();
+    let mut forwarded_headers = incoming.headers.clone();
     forwarded_headers.remove(hyper::header::CONNECTION);
     forwarded_headers.remove(hyper::header::HeaderName::from_static("keep-alive"));
     forwarded_headers.remove(hyper::header::PROXY_AUTHENTICATE);
@@ -1118,9 +1156,9 @@ async fn send_request(
     forwarded_headers.insert(hyper::header::HOST, host);
 
     let mut request = Request::builder()
-        .method(method.clone())
+        .method(incoming.method.clone())
         .uri(uri)
-        .version(version)
+        .version(incoming.version)
         .body(body)
         .map_err(|_| SendFailure::Backend)?;
     *request.headers_mut() = forwarded_headers;
@@ -1128,7 +1166,8 @@ async fn send_request(
     let request_started_at = Instant::now();
     let mut request_future = Box::pin(client.request(request));
     let mut upload_completed_at = None;
-    let mut connect_deadline = Box::pin(tokio::time::sleep(response_timeout));
+    let mut connect_deadline = Box::pin(tokio::time::sleep(timeouts.response));
+
     let response = tokio::select! {
         result = &mut request_future => {
             classify_client_result(result, upload_state.load(Ordering::Acquire))?
@@ -1142,7 +1181,7 @@ async fn send_request(
                     match completed {
                         Ok(Some(completed_at)) => {
                             upload_completed_at = Some(completed_at);
-                            match timeout(response_timeout, &mut request_future).await {
+                            match timeout(timeouts.response, &mut request_future).await {
                                 Ok(result) => classify_client_result(
                                     result,
                                     upload_state.load(Ordering::Acquire),
@@ -1153,7 +1192,7 @@ async fn send_request(
                         Ok(None) => return Err(classify_upload_state(
                             upload_state.load(Ordering::Acquire),
                         )),
-                        Err(_) => match timeout(response_timeout, &mut request_future).await {
+                        Err(_) => match timeout(timeouts.response, &mut request_future).await {
                             Ok(result) => classify_client_result(
                                 result,
                                 upload_state.load(Ordering::Acquire),
@@ -1166,6 +1205,7 @@ async fn send_request(
         }
         _ = connect_deadline.as_mut() => return Err(SendFailure::BackendTimeout),
     };
+
     let mut response = response;
     let upload_finished_at =
         upload_completed_at.or_else(|| upload_completed_rx.try_recv().ok().flatten());
@@ -1173,8 +1213,8 @@ async fn send_request(
     let response_headers_at = Instant::now();
     let response_latency =
         upload_finished_at.map(|started_at| response_headers_at.duration_since(started_at));
-    response.headers_mut().remove(hyper::header::CONNECTION);
 
+    response.headers_mut().remove(hyper::header::CONNECTION);
     response
         .headers_mut()
         .remove(hyper::header::HeaderName::from_static("keep-alive"));

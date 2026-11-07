@@ -56,11 +56,16 @@ struct Server {
     weight: u32,
     max_connections: u32,
     request_timeout: Option<Duration>,
-    health_check_path: hyper::Uri,
-    health_check_timeout: Duration,
-    health_check_healthy_threshold: u32,
-    health_check_unhealthy_threshold: u32,
+    health_check: HealthCheckConfig,
     metrics: Mutex<BackendMetrics>,
+}
+
+#[derive(Debug)]
+struct HealthCheckConfig {
+    path: hyper::Uri,
+    timeout: Duration,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -154,7 +159,7 @@ impl Server {
                         metrics.consecutive_probe_successes =
                             metrics.consecutive_probe_successes.saturating_add(1);
                         if metrics.consecutive_probe_successes
-                            >= self.health_check_healthy_threshold
+                            >= self.health_check.healthy_threshold
                         {
                             metrics.alive = true;
                         }
@@ -163,7 +168,7 @@ impl Server {
                         metrics.consecutive_probe_failures =
                             metrics.consecutive_probe_failures.saturating_add(1);
                         if metrics.consecutive_probe_failures
-                            >= self.health_check_unhealthy_threshold
+                            >= self.health_check.unhealthy_threshold
                         {
                             metrics.alive = false;
                         }
@@ -200,20 +205,14 @@ impl Server {
         weight: u32,
         max_connections: u32,
         request_timeout: Option<Duration>,
-        health_check_path: hyper::Uri,
-        health_check_timeout: Duration,
-        health_check_healthy_threshold: u32,
-        health_check_unhealthy_threshold: u32,
+        health_check: HealthCheckConfig,
     ) -> Self {
         Server {
             addr,
             weight,
             max_connections,
             request_timeout,
-            health_check_path,
-            health_check_timeout,
-            health_check_healthy_threshold,
-            health_check_unhealthy_threshold,
+            health_check,
             metrics: Mutex::new(BackendMetrics {
                 request_latency_ewma: None,
                 health_check_response_time: Duration::ZERO,
@@ -266,10 +265,12 @@ impl LoadBalancer {
                     server.weight,
                     server.max_connections,
                     server.request_timeout,
-                    server.health_check_path,
-                    server.health_check_timeout,
-                    config.health_check_healthy_threshold,
-                    config.health_check_unhealthy_threshold,
+                    HealthCheckConfig {
+                        path: server.health_check_path,
+                        timeout: server.health_check_timeout,
+                        healthy_threshold: config.health_check_healthy_threshold,
+                        unhealthy_threshold: config.health_check_unhealthy_threshold,
+                    },
                 )
             })
             .collect();
