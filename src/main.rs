@@ -228,8 +228,8 @@ impl Server {
     }
 }
 
-impl LoadBalancer {
-    fn new() -> Self {
+impl Default for LoadBalancer {
+    fn default() -> Self {
         LoadBalancer {
             load_balancer: hyper::Uri::from_static("http://127.0.0.1:8000"),
             max_client_connections: 1024,
@@ -247,6 +247,13 @@ impl LoadBalancer {
             save: false,
         }
     }
+}
+
+impl LoadBalancer {
+    fn new() -> Self {
+        Self::default()
+    }
+
     fn update(&mut self, path: &str) -> Result<&LoadBalancer> {
         let config = config::load(path)
             .with_context(|| format!("failed to load configuration from {path:?}"))?;

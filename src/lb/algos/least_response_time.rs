@@ -2,11 +2,12 @@ use crate::lb::Loadbalancer;
 use crate::Server;
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct LeastResponseTime {}
 
 impl LeastResponseTime {
     pub fn new() -> Self {
-        LeastResponseTime {}
+        Self::default()
     }
 }
 

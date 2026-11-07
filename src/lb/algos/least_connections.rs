@@ -2,11 +2,12 @@ use crate::lb::Loadbalancer;
 use crate::Server;
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct LeastConnections {}
 
 impl LeastConnections {
     pub fn new() -> Self {
-        LeastConnections {}
+        Self::default()
     }
 }
 

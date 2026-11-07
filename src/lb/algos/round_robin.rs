@@ -4,15 +4,14 @@ use crate::lb::Loadbalancer;
 use crate::Server;
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct RoundRobin {
     counter: AtomicUsize,
 }
 
 impl RoundRobin {
     pub fn new() -> Self {
-        RoundRobin {
-            counter: AtomicUsize::new(0),
-        }
+        Self::default()
     }
 }
 

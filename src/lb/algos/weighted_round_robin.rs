@@ -3,6 +3,7 @@ use crate::Server;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct WeightedRoundRobin {
     counter: AtomicUsize,
     current_weight: AtomicUsize,
@@ -10,10 +11,7 @@ pub struct WeightedRoundRobin {
 
 impl WeightedRoundRobin {
     pub fn new() -> Self {
-        WeightedRoundRobin {
-            counter: AtomicUsize::new(0),
-            current_weight: AtomicUsize::new(0),
-        }
+        Self::default()
     }
 
     fn gcd(a: usize, b: usize) -> usize {

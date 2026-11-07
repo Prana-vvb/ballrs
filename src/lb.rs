@@ -15,17 +15,16 @@ use http_body_util::{
 };
 use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper::{body::Bytes, HeaderMap, Method, Request, Response, Uri, Version};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{lookup_host, TcpListener};
+use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{timeout, Instant as TokioInstant, Sleep};
+use tokio::time::{Instant as TokioInstant, Sleep};
 
 use crate::{Algorithm, BackendHealthUpdate, LoadBalancer, Server, ServerSnapshot};
 mod algos;
@@ -360,7 +359,7 @@ async fn uri_to_socket_addrs(uri: &Uri) -> std::io::Result<Vec<SocketAddr>> {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let addresses = deduplicate_socket_addrs(lookup_host((host, port)).await?);
+    let addresses = deduplicate_socket_addrs(tokio::net::lookup_host((host, port)).await?);
     if addresses.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
@@ -447,7 +446,7 @@ async fn serve_listener(
             let connection = http1::Builder::new()
                 .serve_connection(
                     io,
-                    service_fn(move |request| {
+                    hyper::service::service_fn(move |request| {
                         handle_request(request, Arc::clone(&proxy))
                     }),
                 );
@@ -547,7 +546,7 @@ pub async fn start_lb(lb: LoadBalancer) -> anyhow::Result<()> {
                     let probe_started_at = Instant::now();
                     let healthy = match backend_uri(&server.addr, &server.health_check.path) {
                         Ok(uri) => matches!(
-                            timeout(
+                            tokio::time::timeout(
                                 server.health_check.timeout,
                                 health_check_client.get(uri.to_string()).send(),
                             )
@@ -720,9 +719,9 @@ async fn listen(
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::SignalKind;
 
-        let mut terminate = signal(SignalKind::terminate())?;
+        let mut terminate = tokio::signal::unix::signal(SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
             _ = terminate.recv() => Ok(()),
@@ -1181,7 +1180,7 @@ async fn send_request(
                     match completed {
                         Ok(Some(completed_at)) => {
                             upload_completed_at = Some(completed_at);
-                            match timeout(timeouts.response, &mut request_future).await {
+                            match tokio::time::timeout(timeouts.response, &mut request_future).await {
                                 Ok(result) => classify_client_result(
                                     result,
                                     upload_state.load(Ordering::Acquire),
@@ -1192,7 +1191,7 @@ async fn send_request(
                         Ok(None) => return Err(classify_upload_state(
                             upload_state.load(Ordering::Acquire),
                         )),
-                        Err(_) => match timeout(timeouts.response, &mut request_future).await {
+                        Err(_) => match tokio::time::timeout(timeouts.response, &mut request_future).await {
                             Ok(result) => classify_client_result(
                                 result,
                                 upload_state.load(Ordering::Acquire),

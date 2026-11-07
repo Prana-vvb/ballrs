@@ -10,7 +10,6 @@ use anyhow::{bail, Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,10 +84,20 @@ struct Row {
     metrics: Metrics,
 }
 
+struct Scenario<'a> {
+    target: &'a str,
+    tcp_nodelay: Option<bool>,
+    url: &'a str,
+    workload: Workload,
+    concurrency: usize,
+    requests: usize,
+}
+
 fn parse_options() -> Result<Options> {
     let mut args = env::args().skip(1);
     let mut quick = false;
     let mut output = None;
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--quick" => quick = true,
@@ -107,6 +116,7 @@ fn parse_options() -> Result<Options> {
             _ => bail!("unknown benchmark option {arg:?}; use --help"),
         }
     }
+
     Ok(Options { quick, output })
 }
 
@@ -119,6 +129,7 @@ fn hey_path() -> Result<PathBuf> {
             }
         }
     }
+
     bail!("Hey is required; install github.com/rakyll/hey and put `hey` on PATH")
 }
 
@@ -129,6 +140,7 @@ async fn backend_service(
         frame.map_err(io::Error::other)?;
     }
     let body = Full::new(Bytes::from(vec![b'G'; 1024]));
+
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
@@ -139,14 +151,16 @@ async fn backend_service(
 async fn start_backend() -> Result<(SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let _ = stream.set_nodelay(true);
+
             tokio::spawn(async move {
-                let service = service_fn(|request| async move {
+                let service = hyper::service::service_fn(|request| async move {
                     match backend_service(request).await {
                         Ok(response) => Ok::<_, io::Error>(response),
                         Err(_) => Ok(Response::builder()
@@ -155,6 +169,7 @@ async fn start_backend() -> Result<(SocketAddr, JoinHandle<()>)> {
                             .expect("static fixture response is valid")),
                     }
                 });
+
                 let _ = http1::Builder::new()
                     .keep_alive(true)
                     .serve_connection(TokioIo::new(stream), service)
@@ -162,6 +177,7 @@ async fn start_backend() -> Result<(SocketAddr, JoinHandle<()>)> {
             });
         }
     });
+
     Ok((address, task))
 }
 
@@ -169,6 +185,7 @@ fn artifact_dir() -> Result<Artifacts> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let path = env::temp_dir().join(format!("balrs-bench-{}-{nonce}", std::process::id()));
     fs::create_dir(&path)?;
+
     Ok(Artifacts(path))
 }
 
@@ -179,12 +196,14 @@ fn binary_path() -> Result<PathBuf> {
         .and_then(Path::parent)
         .context("benchmark executable is not under target/<profile>/deps")?;
     let binary = release_dir.join(format!("Balrs{}", env::consts::EXE_SUFFIX));
+
     if !binary.is_file() {
         bail!(
             "Balrs binary not found at {}; build it first with `cargo build --release --bin Balrs`",
             binary.display()
         );
     }
+
     Ok(binary)
 }
 
@@ -213,6 +232,7 @@ fn write_config(
          health check timeout: 2\n\
          health check interval: 1\n"
     );
+
     fs::write(path, yaml).with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -227,18 +247,22 @@ async fn start_balancer(binary: &Path, config: &Path, log: &Path) -> Result<Runn
         .stderr(Stdio::from(output))
         .spawn()
         .with_context(|| format!("failed to start {}", binary.display()))?;
+
     Ok(RunningBalancer(child))
 }
 
 async fn wait_ready(address: SocketAddr, process: &mut RunningBalancer) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
     loop {
         if let Some(status) = process.0.try_wait()? {
             bail!("Balrs exited before becoming ready: {status}");
         }
+
         if tokio::time::Instant::now() >= deadline {
             bail!("Balrs did not serve a healthy backend at {address} within 15 seconds");
         }
+
         if let Ok(Ok(true)) = tokio::time::timeout(Duration::from_millis(250), async {
             let mut stream = TcpStream::connect(address).await?;
             stream
@@ -262,6 +286,7 @@ fn parse_hey(output: &str) -> Result<Metrics> {
             .lines()
             .find(|line| line.trim_start().starts_with(label))
             .with_context(|| format!("Hey output omitted {label:?}"))?;
+
         line.split_whitespace()
             .find_map(|part| part.parse::<f64>().ok())
             .with_context(|| format!("could not parse Hey summary line {line:?}"))
@@ -287,6 +312,7 @@ fn parse_hey(output: &str) -> Result<Metrics> {
             .lines()
             .find(|line| line.trim_start().starts_with(&prefix))
             .with_context(|| format!("Hey output omitted p{percentile}"))?;
+
         line.split_whitespace()
             .find_map(|part| part.parse::<f64>().ok())
             .with_context(|| format!("could not parse Hey percentile line {line:?}"))
@@ -308,6 +334,7 @@ fn parse_hey(output: &str) -> Result<Metrics> {
                 .sum()
         })
         .unwrap_or(0);
+
     let transport_errors: u64 = output
         .split_once("Error distribution:")
         .map(|(_, rest)| {
@@ -349,6 +376,7 @@ fn run_hey(
         "120",
         "-disable-compression",
     ]);
+
     if matches!(workload, Workload::Post64K) {
         command.args([
             "-m",
@@ -366,9 +394,11 @@ fn run_hey(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+
     if !output.status.success() {
         bail!("Hey exited with {}\n{text}", output.status);
     }
+
     parse_hey(&text).with_context(|| format!("failed to parse Hey output:\n{text}"))
 }
 
@@ -395,6 +425,7 @@ fn write_csv(path: &Path, rows: &[Row]) -> Result<()> {
             row.metrics.p99_ms,
         ));
     }
+
     fs::write(path, csv).with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -405,34 +436,44 @@ fn default_output_path() -> PathBuf {
 
 async fn run_scenario(
     hey: &Path,
-    target: &str,
-    nodelay: Option<bool>,
-    base_url: &str,
-    workload: Workload,
-    concurrency: usize,
-    requests: usize,
+    scenario: Scenario<'_>,
     body_path: &Path,
     rows: &mut Vec<Row>,
 ) -> Result<()> {
-    let metrics = run_hey(hey, base_url, body_path, workload, concurrency, requests)?;
+    let metrics = run_hey(
+        hey,
+        scenario.url,
+        body_path,
+        scenario.workload,
+        scenario.concurrency,
+        scenario.requests,
+    )?;
     println!(
-        "{target:28} {:10} nodelay={:<5} c={concurrency:3} {:9.1} req/s p95={:.3}ms p99={:.3}ms 200={} other={} errors={}",
-        workload.name(),
-        nodelay.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
-        metrics.requests_per_second,
-        metrics.p95_ms,
-        metrics.p99_ms,
-        metrics.status_200,
-        metrics.status_other,
-        metrics.transport_errors,
+        "{target:28} {workload:10} nodelay={nodelay:<5} c={concurrency:3} {requests_per_second:9.1} req/s p95={p95_ms:.3}ms p99={p99_ms:.3}ms 200={status_200} other={status_other} errors={transport_errors}",
+        target = scenario.target,
+        workload = scenario.workload.name(),
+        nodelay = scenario
+            .tcp_nodelay
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+        concurrency = scenario.concurrency,
+        requests_per_second = metrics.requests_per_second,
+        p95_ms = metrics.p95_ms,
+        p99_ms = metrics.p99_ms,
+        status_200 = metrics.status_200,
+        status_other = metrics.status_other,
+        transport_errors = metrics.transport_errors,
     );
+
     rows.push(Row {
-        target: target.to_owned(),
-        workload: workload.name().to_owned(),
-        tcp_nodelay: nodelay.map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
-        concurrency,
+        target: scenario.target.to_owned(),
+        workload: scenario.workload.name().to_owned(),
+        tcp_nodelay: scenario
+            .tcp_nodelay
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string()),
+        concurrency: scenario.concurrency,
         metrics,
     });
+
     Ok(())
 }
 
@@ -466,9 +507,11 @@ async fn run() -> Result<()> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let address = listener.local_addr()?;
             drop(listener);
+
             let config_path = artifacts.0.join(format!("{target}.yaml"));
             let log_path = artifacts.0.join(format!("{target}.log"));
             write_config(&config_path, address, &backend_addrs, target, false)?;
+
             let mut process = start_balancer(&binary, &config_path, &log_path).await?;
             wait_ready(address, &mut process)
                 .await
@@ -477,12 +520,14 @@ async fn run() -> Result<()> {
             for concurrency in CONCURRENCIES {
                 run_scenario(
                     &hey,
-                    target,
-                    Some(false),
-                    &format!("http://{address}/"),
-                    Workload::Get,
-                    concurrency,
-                    requests,
+                    Scenario {
+                        target,
+                        tcp_nodelay: Some(false),
+                        url: &format!("http://{address}/"),
+                        workload: Workload::Get,
+                        concurrency,
+                        requests,
+                    },
                     &body_path,
                     &mut rows,
                 )
@@ -495,12 +540,14 @@ async fn run() -> Result<()> {
         for concurrency in CONCURRENCIES {
             run_scenario(
                 &hey,
-                target,
-                None,
-                &base_url,
-                Workload::Get,
-                concurrency,
-                requests,
+                Scenario {
+                    target,
+                    tcp_nodelay: None,
+                    url: &base_url,
+                    workload: Workload::Get,
+                    concurrency,
+                    requests,
+                },
                 &body_path,
                 &mut rows,
             )
@@ -514,36 +561,44 @@ async fn run() -> Result<()> {
     for concurrency in CONCURRENCIES {
         run_scenario(
             &hey,
-            "direct",
-            None,
-            &format!("http://{}/", backend_addrs[0]),
-            Workload::Post64K,
-            concurrency,
-            requests,
+            Scenario {
+                target: "direct",
+                tcp_nodelay: None,
+                url: &format!("http://{}/", backend_addrs[0]),
+                workload: Workload::Post64K,
+                concurrency,
+                requests,
+            },
             &body_path,
             &mut rows,
         )
         .await?;
     }
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     drop(listener);
+
     let config_path = artifacts.0.join("round_robin_post.yaml");
     let log_path = artifacts.0.join("round_robin_post.log");
     write_config(&config_path, address, &backend_addrs, "round_robin", false)?;
+
     let mut process = start_balancer(&binary, &config_path, &log_path).await?;
     wait_ready(address, &mut process)
         .await
         .context("round-robin POST target failed readiness")?;
+
     for concurrency in CONCURRENCIES {
         run_scenario(
             &hey,
-            "round_robin",
-            Some(false),
-            &format!("http://{address}/"),
-            Workload::Post64K,
-            concurrency,
-            requests,
+            Scenario {
+                target: "round_robin",
+                tcp_nodelay: Some(false),
+                url: &format!("http://{address}/"),
+                workload: Workload::Post64K,
+                concurrency,
+                requests,
+            },
             &body_path,
             &mut rows,
         )
@@ -555,22 +610,27 @@ async fn run() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     drop(listener);
+
     let config_path = artifacts.0.join("round_robin_nodelay_true.yaml");
     let log_path = artifacts.0.join("round_robin_nodelay_true.log");
     write_config(&config_path, address, &backend_addrs, "round_robin", true)?;
+
     let mut process = start_balancer(&binary, &config_path, &log_path).await?;
     wait_ready(address, &mut process)
         .await
         .context("Balrs with backend TCP_NODELAY enabled failed readiness")?;
+
     for concurrency in CONCURRENCIES {
         run_scenario(
             &hey,
-            "round_robin",
-            Some(true),
-            &format!("http://{address}/"),
-            Workload::Post64K,
-            concurrency,
-            requests,
+            Scenario {
+                target: "round_robin",
+                tcp_nodelay: Some(true),
+                url: &format!("http://{address}/"),
+                workload: Workload::Post64K,
+                concurrency,
+                requests,
+            },
             &body_path,
             &mut rows,
         )
@@ -581,12 +641,14 @@ async fn run() -> Result<()> {
     for task in backend_tasks {
         task.abort();
     }
+
     write_csv(&output_path, &rows)?;
     println!(
         "\nSaved {} measured rows to {}",
         rows.len(),
         output_path.display()
     );
+
     Ok(())
 }
 
